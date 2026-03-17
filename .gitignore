@@ -1,0 +1,28 @@
+# Build artifacts
+/target
+
+# Cargo lock (optional for binaries, uncomment if desired)
+# Cargo.lock
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Database instance files
+data/
+
+# Notes
+notes/
+
+# Logs
+logs/
+
+# Environment
+.env
