@@ -16,13 +16,15 @@ pub fn load_catalog(data_dir: &Path, text_mode: bool) -> Result<Catalog> {
         schemas: load_schemas(&systbsp, text_mode)?,
         tables: load_tables(&systbsp, text_mode)?,
         columns: load_columns(&systbsp, text_mode)?,
+        bufferpools: load_bufferpools(&systbsp, text_mode)?,
     };
     log::info!(
-        "catalog loaded: {} tablespaces, {} schemas, {} tables, {} columns",
+        "catalog loaded: {} tablespaces, {} schemas, {} tables, {} columns, {} bufferpools",
         catalog.tablespaces.len(),
         catalog.schemas.len(),
         catalog.tables.len(),
         catalog.columns.len(),
+        catalog.bufferpools.len(),
     );
     Ok(catalog)
 }
@@ -92,6 +94,7 @@ fn load_tablespaces(dir: &Path, text_mode: bool) -> Result<Vec<Tablespace>> {
                 datatype: col(r, 3, "SYSTABLESPACES")?,
                 pagesize: parse_i32(&col(r, 4, "SYSTABLESPACES")?)?,
                 state: col(r, 5, "SYSTABLESPACES")?,
+                bufferpoolid: parse_i32(&col(r, 6, "SYSTABLESPACES")?)?,
             }))
             .collect()
     } else {
@@ -106,6 +109,7 @@ fn load_tablespaces(dir: &Path, text_mode: bool) -> Result<Vec<Tablespace>> {
                     datatype: r.read_string()?,
                     pagesize: r.read_i32()?,
                     state: r.read_string()?,
+                    bufferpoolid: r.read_i32()?,
                 })
             })
             .collect()
@@ -181,6 +185,33 @@ fn load_columns(dir: &Path, text_mode: bool) -> Result<Vec<Column>> {
                     ordinal: r.read_i16()?,
                     typename: r.read_string()?,
                     nullable: r.read_bool()?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn load_bufferpools(dir: &Path, text_mode: bool) -> Result<Vec<BufferPool>> {
+    if text_mode {
+        read_text_rows(dir, "SYSBUFFERPOOLS")?
+            .iter()
+            .map(|r| Ok(BufferPool {
+                bpid: parse_i32(&col(r, 0, "SYSBUFFERPOOLS")?)?,
+                bpname: col(r, 1, "SYSBUFFERPOOLS")?,
+                pagesize: parse_i32(&col(r, 2, "SYSBUFFERPOOLS")?)?,
+                npages: parse_i32(&col(r, 3, "SYSBUFFERPOOLS")?)?,
+            }))
+            .collect()
+    } else {
+        read_binary_rows(dir, "SYSBUFFERPOOLS")?
+            .iter()
+            .map(|row| {
+                let mut r = RowReader::new(row);
+                Ok(BufferPool {
+                    bpid: r.read_i32()?,
+                    bpname: r.read_string()?,
+                    pagesize: r.read_i32()?,
+                    npages: r.read_i32()?,
                 })
             })
             .collect()

@@ -19,7 +19,186 @@ const SLOT_SIZE: usize = 4; // u16 offset + u16 length
 pub const PAGE_TYPE_FREE: u8 = 0;
 pub const PAGE_TYPE_DATA: u8 = 1;
 
-/// A slotted page stored in a fixed-size byte buffer.
+// ── Free functions: shared page logic on raw byte slices ──
+// These are the single source of truth — SlottedPage, PageRef, and PageMut
+// all delegate to these so that data‐layout knowledge lives in one place.
+
+pub(crate) fn page_id_of(buf: &[u8]) -> PageId {
+    get_u64(buf, PAGE_ID_OFF)
+}
+
+fn page_type_of(buf: &[u8]) -> u8 {
+    buf[PAGE_TYPE_OFF]
+}
+
+fn slot_count_of(buf: &[u8]) -> u16 {
+    get_u16(buf, SLOT_COUNT_OFF)
+}
+
+pub(crate) fn free_space_of(buf: &[u8]) -> usize {
+    let dir_end = PAGE_HEADER_SIZE + (slot_count_of(buf) as usize) * SLOT_SIZE;
+    let data_start = get_u16(buf, FREE_SPACE_OFF) as usize;
+    if data_start <= dir_end + SLOT_SIZE {
+        0
+    } else {
+        data_start - dir_end - SLOT_SIZE
+    }
+}
+
+fn slot_of(buf: &[u8], idx: SlotIndex) -> (u16, u16) {
+    let base = PAGE_HEADER_SIZE + (idx as usize) * SLOT_SIZE;
+    (get_u16(buf, base), get_u16(buf, base + 2))
+}
+
+fn read_row_from(buf: &[u8], slot: SlotIndex) -> Option<&[u8]> {
+    if slot >= slot_count_of(buf) {
+        return None;
+    }
+    let (off, len) = slot_of(buf, slot);
+    if off == 0 && len == 0 {
+        return None; // deleted
+    }
+    Some(&buf[off as usize..(off + len) as usize])
+}
+
+fn insert_row_into(buf: &mut [u8], row: &[u8]) -> Option<SlotIndex> {
+    if free_space_of(buf) < row.len() {
+        return None;
+    }
+
+    // Allocate row space (grows from end toward header).
+    let data_start = get_u16(buf, FREE_SPACE_OFF) as usize;
+    let new_data_start = data_start - row.len();
+    buf[new_data_start..new_data_start + row.len()].copy_from_slice(row);
+    put_u16(buf, FREE_SPACE_OFF, new_data_start as u16);
+
+    // Check for a reusable deleted slot.
+    let slot_count = slot_count_of(buf) as usize;
+    let mut slot_idx = slot_count; // default: append new slot
+    for i in 0..slot_count {
+        let (off, len) = slot_of(buf, i as u16);
+        if off == 0 && len == 0 {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    let slot_off = PAGE_HEADER_SIZE + slot_idx * SLOT_SIZE;
+    put_u16(buf, slot_off, new_data_start as u16);
+    put_u16(buf, slot_off + 2, row.len() as u16);
+
+    if slot_idx == slot_count {
+        put_u16(buf, SLOT_COUNT_OFF, (slot_count + 1) as u16);
+    }
+
+    update_checksum_of(buf);
+    Some(slot_idx as SlotIndex)
+}
+
+fn delete_row_from(buf: &mut [u8], slot: SlotIndex) -> bool {
+    if slot >= slot_count_of(buf) {
+        return false;
+    }
+    let (off, len) = slot_of(buf, slot);
+    if off == 0 && len == 0 {
+        return false; // already deleted
+    }
+    let slot_off = PAGE_HEADER_SIZE + (slot as usize) * SLOT_SIZE;
+    put_u16(buf, slot_off, 0);
+    put_u16(buf, slot_off + 2, 0);
+    update_checksum_of(buf);
+    true
+}
+
+/// Initialize a raw buffer as an empty data page with the given page_id.
+pub(crate) fn init_page_buf(buf: &mut [u8], page_id: PageId) {
+    buf.fill(0);
+    put_u64(buf, PAGE_ID_OFF, page_id);
+    buf[PAGE_TYPE_OFF] = PAGE_TYPE_DATA;
+    put_u16(buf, FREE_SPACE_OFF, buf.len() as u16);
+    put_u16(buf, SLOT_COUNT_OFF, 0);
+    update_checksum_of(buf);
+}
+
+fn checksum_of(buf: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&buf[..CHECKSUM_OFF]);
+    h.update(&buf[CHECKSUM_OFF + 4..]);
+    h.finalize()
+}
+
+pub(crate) fn verify_checksum_of(buf: &[u8]) -> Result<()> {
+    let stored = get_u32(buf, CHECKSUM_OFF);
+    let computed = checksum_of(buf);
+    if stored != computed {
+        return Err(Error::Corruption(format!(
+            "page {} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}",
+            page_id_of(buf)
+        )));
+    }
+    Ok(())
+}
+
+fn update_checksum_of(buf: &mut [u8]) {
+    let crc = checksum_of(buf);
+    put_u32(buf, CHECKSUM_OFF, crc);
+}
+
+// ── Traits: PageRead / PageWrite ──
+// Shared method signatures with default impls that delegate to the free
+// functions above. Each concrete type only provides buf() / buf_mut().
+
+/// Read-only operations on any page buffer.
+pub trait PageRead {
+    /// Access the underlying byte buffer.
+    fn buf(&self) -> &[u8];
+
+    fn page_id(&self) -> PageId {
+        page_id_of(self.buf())
+    }
+
+    fn page_type(&self) -> u8 {
+        page_type_of(self.buf())
+    }
+
+    fn slot_count(&self) -> u16 {
+        slot_count_of(self.buf())
+    }
+
+    fn page_size(&self) -> usize {
+        self.buf().len()
+    }
+
+    fn free_space(&self) -> usize {
+        free_space_of(self.buf())
+    }
+
+    fn read_row(&self, slot: SlotIndex) -> Option<&[u8]> {
+        read_row_from(self.buf(), slot)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.buf()
+    }
+}
+
+/// Mutable operations on a page buffer.
+pub trait PageWrite: PageRead {
+    /// Access the underlying byte buffer mutably.
+    fn buf_mut(&mut self) -> &mut [u8];
+
+    fn insert_row(&mut self, row: &[u8]) -> Option<SlotIndex> {
+        insert_row_into(self.buf_mut(), row)
+    }
+
+    fn delete_row(&mut self, slot: SlotIndex) -> bool {
+        delete_row_from(self.buf_mut(), slot)
+    }
+}
+
+// ── SlottedPage: owned buffer (used by HeapFile and standalone code) ──
+
+/// A slotted page stored in an owned byte buffer.
 ///
 /// Layout:
 /// ```text
@@ -36,14 +215,8 @@ impl SlottedPage {
     /// Create a new empty data page.
     pub fn new(page_id: PageId, page_size: usize) -> Self {
         let mut buf = vec![0u8; page_size];
-        put_u64(&mut buf, PAGE_ID_OFF, page_id);
-        buf[PAGE_TYPE_OFF] = PAGE_TYPE_DATA;
-        // free_space initially points to the end of the page
-        put_u16(&mut buf, FREE_SPACE_OFF, page_size as u16);
-        put_u16(&mut buf, SLOT_COUNT_OFF, 0);
-        let mut page = Self { buf };
-        page.update_checksum();
-        page
+        init_page_buf(&mut buf, page_id);
+        Self { buf }
     }
 
     /// Wrap an existing byte buffer as a page (e.g. read from disk).
@@ -51,147 +224,76 @@ impl SlottedPage {
         if buf.len() < PAGE_HEADER_SIZE {
             return Err(Error::Corruption("page too small for header".into()));
         }
-        let page = Self { buf };
-        page.verify_checksum()?;
-        Ok(page)
-    }
-
-    // ── Header accessors ──
-
-    pub fn page_id(&self) -> PageId {
-        get_u64(&self.buf, PAGE_ID_OFF)
-    }
-
-    pub fn page_type(&self) -> u8 {
-        self.buf[PAGE_TYPE_OFF]
-    }
-
-    pub fn slot_count(&self) -> u16 {
-        get_u16(&self.buf, SLOT_COUNT_OFF)
-    }
-
-    pub fn page_size(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Usable free space available for a new row (including its slot entry).
-    pub fn free_space(&self) -> usize {
-        let dir_end = PAGE_HEADER_SIZE + (self.slot_count() as usize) * SLOT_SIZE;
-        let data_start = get_u16(&self.buf, FREE_SPACE_OFF) as usize;
-        if data_start <= dir_end + SLOT_SIZE {
-            0
-        } else {
-            data_start - dir_end - SLOT_SIZE
-        }
-    }
-
-    /// Insert a row into the page. Returns the slot index, or `None` if the
-    /// row does not fit.
-    pub fn insert_row(&mut self, row: &[u8]) -> Option<SlotIndex> {
-        if self.free_space() < row.len() {
-            return None;
-        }
-
-        // Allocate row space (grows from end toward header).
-        let data_start = get_u16(&self.buf, FREE_SPACE_OFF) as usize;
-        let new_data_start = data_start - row.len();
-        self.buf[new_data_start..new_data_start + row.len()].copy_from_slice(row);
-        put_u16(&mut self.buf, FREE_SPACE_OFF, new_data_start as u16);
-
-        // Check for a reusable deleted slot.
-        let slot_count = self.slot_count() as usize;
-        let mut slot_idx = slot_count; // default: append new slot
-        for i in 0..slot_count {
-            let (off, len) = self.slot(i as u16);
-            if off == 0 && len == 0 {
-                slot_idx = i;
-                break;
-            }
-        }
-
-        let slot_off = PAGE_HEADER_SIZE + slot_idx * SLOT_SIZE;
-        put_u16(&mut self.buf, slot_off, new_data_start as u16);
-        put_u16(&mut self.buf, slot_off + 2, row.len() as u16);
-
-        if slot_idx == slot_count {
-            put_u16(&mut self.buf, SLOT_COUNT_OFF, (slot_count + 1) as u16);
-        }
-
-        self.update_checksum();
-        Some(slot_idx as SlotIndex)
-    }
-
-    /// Read the row bytes at the given slot. Returns `None` if the slot is
-    /// deleted or out of range.
-    pub fn read_row(&self, slot: SlotIndex) -> Option<&[u8]> {
-        if slot >= self.slot_count() {
-            return None;
-        }
-        let (off, len) = self.slot(slot);
-        if off == 0 && len == 0 {
-            return None; // deleted
-        }
-        Some(&self.buf[off as usize..(off + len) as usize])
-    }
-
-    /// Mark a slot as deleted. The space is not reclaimed until the page is
-    /// compacted.
-    pub fn delete_row(&mut self, slot: SlotIndex) -> bool {
-        if slot >= self.slot_count() {
-            return false;
-        }
-        let (off, len) = self.slot(slot);
-        if off == 0 && len == 0 {
-            return false; // already deleted
-        }
-        let slot_off = PAGE_HEADER_SIZE + (slot as usize) * SLOT_SIZE;
-        put_u16(&mut self.buf, slot_off, 0);
-        put_u16(&mut self.buf, slot_off + 2, 0);
-        self.update_checksum();
-        true
-    }
-
-    /// Return the raw page buffer (for writing to disk).
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
+        verify_checksum_of(&buf)?;
+        Ok(Self { buf })
     }
 
     /// Consume the page and return the inner buffer.
     pub fn into_bytes(self) -> Vec<u8> {
         self.buf
     }
+}
 
-    // ── Internal helpers ──
-
-    /// Read slot (offset, length) for a given index.
-    fn slot(&self, idx: SlotIndex) -> (u16, u16) {
-        let base = PAGE_HEADER_SIZE + (idx as usize) * SLOT_SIZE;
-        (get_u16(&self.buf, base), get_u16(&self.buf, base + 2))
+impl PageRead for SlottedPage {
+    fn buf(&self) -> &[u8] {
+        &self.buf
     }
+}
 
-    fn checksum_range(&self) -> u32 {
-        // Checksum covers everything except the checksum field itself.
-        let mut h = crc32fast::Hasher::new();
-        h.update(&self.buf[..CHECKSUM_OFF]);
-        h.update(&self.buf[CHECKSUM_OFF + 4..]);
-        h.finalize()
+impl PageWrite for SlottedPage {
+    fn buf_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
+}
 
-    fn update_checksum(&mut self) {
-        let crc = self.checksum_range();
-        put_u32(&mut self.buf, CHECKSUM_OFF, crc);
+// ── PageRef: read-only borrowed view (returned by buffer pool) ──
+
+/// Read-only view of a page backed by a borrowed byte slice.
+///
+/// Created by `BufferPool::fetch_page`. The slice lives in the pool's
+/// pre-allocated memory region.
+#[derive(Debug)]
+pub struct PageRef<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> PageRef<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
     }
+}
 
-    fn verify_checksum(&self) -> Result<()> {
-        let stored = get_u32(&self.buf, CHECKSUM_OFF);
-        let computed = self.checksum_range();
-        if stored != computed {
-            return Err(Error::Corruption(format!(
-                "page {} checksum mismatch: stored={stored:#010x}, computed={computed:#010x}",
-                self.page_id()
-            )));
-        }
-        Ok(())
+impl PageRead for PageRef<'_> {
+    fn buf(&self) -> &[u8] {
+        self.buf
+    }
+}
+
+// ── PageMut: mutable borrowed view (returned by buffer pool) ──
+
+/// Mutable view of a page backed by a borrowed byte slice.
+///
+/// Created by `BufferPool::fetch_page_mut` and `BufferPool::new_page`.
+/// The slice lives in the pool's pre-allocated memory region.
+pub struct PageMut<'a> {
+    buf: &'a mut [u8],
+}
+
+impl<'a> PageMut<'a> {
+    pub(crate) fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf }
+    }
+}
+
+impl PageRead for PageMut<'_> {
+    fn buf(&self) -> &[u8] {
+        self.buf
+    }
+}
+
+impl PageWrite for PageMut<'_> {
+    fn buf_mut(&mut self) -> &mut [u8] {
+        self.buf
     }
 }
 

@@ -148,6 +148,8 @@ from disk to check for space. (Can be upgraded to an on-disk bitmap later.)
 | `open` | `(path, page_size) -> Result<Self>` | Open or create a `.DAT` file |
 | `read_page` | `(&mut self, PageId) -> Result<SlottedPage>` | Read page from disk |
 | `write_page` | `(&mut self, &SlottedPage) -> Result<()>` | Write page to disk |
+| `read_page_into` | `(&mut self, PageId, &mut [u8]) -> Result<()>` | Read page into caller buffer (zero-alloc) |
+| `write_page_buf` | `(&mut self, &[u8]) -> Result<()>` | Write raw page bytes to disk |
 | `insert_row` | `(&mut self, &[u8]) -> Result<Rid>` | Find/create page, insert row |
 | `read_row` | `(&mut self, Rid) -> Result<Vec<u8>>` | Fetch row by RID |
 | `delete_row` | `(&mut self, Rid) -> Result<bool>` | Tombstone a row |
@@ -180,30 +182,79 @@ The buffer pool sits between heap files and the rest of the engine. All page
 reads/writes go through it. No component above the buffer pool touches disk
 directly.
 
-**Design:**
-- Fixed-size pool of `N` page frames (configurable, default 128 or any size)
-- **LRU replacement policy** — `VecDeque<FrameIndex>` where front = oldest
+**Design — Pre-Allocated Contiguous Pool:**
+
+All `capacity × page_size` bytes are allocated **once** at construction in a
+single contiguous `Vec<u8>`. Each frame owns a fixed slice of this region —
+no per-page heap allocation occurs on the fetch/evict hot path.
+
+- **Fixed page size per pool** — `BufferPool::new("name", capacity, page_size)`.
+  All registered files must match the pool's page size (DB2-style).
+- **Named pools** — Each `BufferPool` carries a name (e.g., `"RQDEFAULTBP"`)
+  for diagnostics and catalog correlation.
+- **One contiguous memory region** — `pool_buf: Vec<u8>` of
+  `capacity * page_size` bytes. Frame `i` occupies
+  `pool_buf[i*page_size .. (i+1)*page_size]`.
+- **Metadata-only frames** — `FrameMeta` tracks `file_id`, `page_id`,
+  `pin_count`, `dirty`, `in_use`. No per-frame `SlottedPage` or `Vec<u8>`.
+- **LRU replacement policy** — `VecDeque<FrameIndex>` where front = oldest.
 - **Dirty-page tracking** — frames carry a `dirty: bool` flag; dirty pages
-  are flushed to disk before eviction (lazy/async flush model)
+  are flushed to disk before eviction (lazy flush model).
 - **Pin count** — pages in active use are pinned; pinned frames cannot be
   evicted. A frame re-enters the LRU list only when `pin_count` drops to 0.
 - **File registration** — `register_file(path, page_size) -> FileId` maps
-  arbitrary `.DAT` files into the pool by ID
+  `.DAT` files into the pool. Page size is validated against the pool's size.
+
+**Zero-allocation I/O path:**
+
+On `fetch_page`, data is read from disk directly into the pre-allocated frame
+slice via `HeapFile::read_page_into()` — no temporary `Vec<u8>` allocation.
+Checksum verification runs on the in-place data. On flush, frame data is
+written back via `HeapFile::write_page_buf()`.
+
+**Borrowed page views (`PageRef` / `PageMut`):**
+
+The pool returns lightweight view types instead of owned `SlottedPage`:
+- `PageRef<'a>` — read-only view wrapping `&'a [u8]` from the pool buffer
+- `PageMut<'a>` — mutable view wrapping `&'a mut [u8]` from the pool buffer
+
+Both types implement the `PageRead` / `PageWrite` traits (defined in
+`page.rs`) via shared free functions — no logic duplication. `SlottedPage`
+(owned `Vec<u8>`) continues to be used by `HeapFile` for standalone I/O.
 
 ### Buffer Pool API
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `new` | `(capacity) -> Self` | Create pool with N frames |
-| `register_file` | `(&mut self, path, page_size) -> Result<FileId>` | Register a heap file |
-| `fetch_page` | `(&mut self, FileId, PageId) -> Result<&SlottedPage>` | Pin & return read-only ref |
-| `fetch_page_mut` | `(&mut self, FileId, PageId) -> Result<&mut SlottedPage>` | Pin & return mutable ref (auto-dirty) |
-| `new_page` | `(&mut self, FileId) -> Result<(PageId, &mut SlottedPage)>` | Allocate new page, pinned + dirty |
+| `new` | `(name, capacity, page_size) -> Self` | Pre-allocate named pool with N frames |
+| `name` | `(&self) -> &str` | Pool name for diagnostics |
+| `register_file` | `(&mut self, path, page_size) -> Result<FileId>` | Register a heap file (page size validated) |
+| `fetch_page` | `(&mut self, FileId, PageId) -> Result<PageRef<'_>>` | Pin & return read-only view |
+| `fetch_page_mut` | `(&mut self, FileId, PageId) -> Result<PageMut<'_>>` | Pin & return mutable view (auto-dirty) |
+| `new_page` | `(&mut self, FileId) -> Result<(PageId, PageMut<'_>)>` | Allocate new page, pinned + dirty |
 | `unpin` | `(&mut self, FileId, PageId, dirty: bool) -> Result<()>` | Decrement pin, optionally mark dirty |
 | `flush_page` | `(&mut self, FileId, PageId) -> Result<()>` | Write dirty page to disk |
 | `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages |
 | `used_frames` | `(&self) -> usize` | Count of occupied frames |
 | `capacity` | `(&self) -> usize` | Total frame count |
+| `page_size` | `(&self) -> usize` | Fixed page size for this pool |
+
+### Page Trait Hierarchy (`page.rs`)
+
+Core page operations are implemented as free functions on `&[u8]` / `&mut [u8]`
+slices. Three concrete types delegate to them via traits:
+
+```
+PageRead (trait)          PageWrite (trait: PageRead)
+├─ SlottedPage (owned)    ├─ SlottedPage
+├─ PageRef<'a> (borrowed) └─ PageMut<'a> (borrowed)
+└─ PageMut<'a>
+```
+
+| Trait | Methods |
+|-------|---------|
+| `PageRead` | `page_id`, `page_type`, `slot_count`, `page_size`, `free_space`, `read_row`, `as_bytes` |
+| `PageWrite` | `insert_row`, `delete_row` |
 
 ### Dirty Page Flush Model
 
@@ -223,7 +274,7 @@ Pages are **not** flushed synchronously on every write. Instead:
 4. Remove old page-table entry, reset frame, return for reuse.
 5. If the LRU deque is empty (all frames pinned) → return error.
 
-### Tests (12)
+### Tests (14)
 
 - `fetch_and_unpin` — basic fetch + unpin lifecycle
 - `fetch_same_page_twice` — pool hit returns same frame
@@ -237,21 +288,44 @@ Pages are **not** flushed synchronously on every write. Instead:
 - `multiple_files` — separate files coexist in pool
 - `unpin_twice_errors` — double-unpin caught
 - `fetch_mut_marks_dirty` — mutable fetch auto-dirties
+- `page_size_mismatch_rejected` — file with wrong page size rejected
+- `pre_allocated_capacity` — verifies upfront allocation size and name
 
-### TODO: Convert to Pre-Allocated Pool
+### BufferPoolManager
 
-The current implementation allocates page buffers on-demand (`Vec<u8>` per
-`SlottedPage`). Real database engines (DB2, PostgreSQL, MySQL) use a single
-contiguous pre-allocated memory region. Benefits of converting:
+A `BufferPoolManager` centralises multiple `BufferPool` instances in a single
+`HashMap<BufferPoolId, BufferPool>`, allowing different workloads to use
+independent pools with potentially different page sizes:
 
-- **Predictable memory** — claim all memory at startup, no surprise OOM
-- **Zero allocation in hot path** — page fetch is a `memcpy` into a fixed slice
-- **Cache/TLB locality** — one contiguous region vs scattered heap allocations
-- **No fragmentation** — avoid alloc/free churn from thousands of page loads
-- **Recovery safety** — fixed memory budget, pool never grows
+| Pool (default) | Purpose | Page Size |
+|----------------|---------|-----------|
+| `RQDEFAULTBP` (id=1) | Regular data | 4 KB |
+| `INDEXBP` (id=2) | Index pages | 4 KB |
+| `LOBBP` (id=3) | Large-object data | 32 KB |
+| `TEMPBP` (id=4) | Temporary/sort scratch | 4 KB |
 
-Target design: allocate `capacity × page_size` bytes upfront, each frame owns
-a fixed slice, `SlottedPage` borrows the slice instead of owning a `Vec<u8>`.
+Each tablespace in `SYSTABLESPACES` references a `BUFFERPOOLID` that maps to
+one of these pools. At startup the engine creates pools from `SYSBUFFERPOOLS`
+catalog rows, then routes all file registrations to the correct pool.
+
+### BufferPoolManager API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `() -> Self` | Create empty manager |
+| `create_pool` | `(&mut self, id, name, capacity, page_size) -> Result<()>` | Add a new pool |
+| `get` | `(&self, id) -> Result<&BufferPool>` | Borrow pool by ID |
+| `get_mut` | `(&mut self, id) -> Result<&mut BufferPool>` | Mutable borrow by ID |
+| `register_file` | `(&mut self, pool_id, path, page_size) -> Result<FileId>` | Register file in a specific pool |
+| `flush_all` | `(&mut self) -> Result<()>` | Flush every dirty page in every pool |
+| `pool_ids` | `(&self) -> Vec<(BufferPoolId, &str)>` | List (id, name) pairs sorted by id |
+
+### BufferPoolManager Tests (4)
+
+- `manager_create_multiple_pools` — creates 3 pools, validates name/capacity/page_size
+- `manager_duplicate_pool_id_rejected` — duplicate pool ID returns error
+- `manager_register_file_routes_to_pool` — files registered to different pools
+- `manager_flush_all_pools` — flush_all succeeds across empty pools
 
 ### Phase 4 — Tablespace Manager (`tablespace.rs`)
 

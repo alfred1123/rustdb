@@ -21,8 +21,9 @@ pub fn bootstrap(data_dir: &Path, config: &DbConfig) -> Result<()> {
     write_sysschemas(&systbsp, config.text_mode)?;
     write_systables(&systbsp, config.text_mode)?;
     write_syscolumns(&systbsp, config.text_mode)?;
+    write_sysbufferpools(&systbsp, config.page_size, config.text_mode)?;
 
-    log::info!("bootstrap complete: SQLDBCONF + 4 catalog tables written");
+    log::info!("bootstrap complete: SQLDBCONF + 5 catalog tables written");
     Ok(())
 }
 
@@ -49,18 +50,19 @@ fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary
 
 fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let ps = page_size as i32;
-    let data: [(i32, &str, &str, &str, &str); 3] = [
-        (1, "SYSTBSP", "S", "A", "N"),
-        (2, "USERTBSP", "D", "A", "N"),
-        (3, "TEMPTBSP", "D", "T", "N"),
+    // (tbspaceid, tbspace, tbspacetype, datatype, pagesize, state, bufferpoolid)
+    let data: [(i32, &str, &str, &str, &str, i32); 3] = [
+        (1, "SYSTBSP", "S", "A", "N", 1),
+        (2, "USERTBSP", "D", "A", "N", 1),
+        (3, "TEMPTBSP", "D", "T", "N", 4),
     ];
 
     let text_rows: Vec<String> = data.iter()
-        .map(|(id, name, tt, dt, state)| format!("{id}\t{name}\t{tt}\t{dt}\t{ps}\t{state}"))
+        .map(|(id, name, tt, dt, state, bpid)| format!("{id}\t{name}\t{tt}\t{dt}\t{ps}\t{state}\t{bpid}"))
         .collect();
 
     let binary_rows: Vec<Vec<u8>> = data.iter()
-        .map(|(id, name, tt, dt, state)| {
+        .map(|(id, name, tt, dt, state, bpid)| {
             let mut w = RowWriter::new();
             w.write_i32(*id);
             w.write_string(name);
@@ -68,11 +70,12 @@ fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result
             w.write_string(dt);
             w.write_i32(ps);
             w.write_string(state);
+            w.write_i32(*bpid);
             w.finish()
         })
         .collect();
 
-    write_dat(dir, "SYSTABLESPACES", "TBSPACEID\tTBSPACE\tTBSPACETYPE\tDATATYPE\tPAGESIZE\tSTATE", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSTABLESPACES", "TBSPACEID\tTBSPACE\tTBSPACETYPE\tDATATYPE\tPAGESIZE\tSTATE\tBUFFERPOOLID", &text_rows, &binary_rows, text_mode)
 }
 
 fn write_sysschemas(dir: &Path, text_mode: bool) -> Result<()> {
@@ -82,11 +85,12 @@ fn write_sysschemas(dir: &Path, text_mode: bool) -> Result<()> {
 }
 
 fn write_systables(dir: &Path, text_mode: bool) -> Result<()> {
-    let tables: [(&str, i16); 4] = [
-        ("SYSTABLESPACES", 6i16),
+    let tables: [(&str, i16); 5] = [
+        ("SYSTABLESPACES", 7i16),
         ("SYSSCHEMAS", 1),
         ("SYSTABLES", 4),
         ("SYSCOLUMNS", 6),
+        ("SYSBUFFERPOOLS", 4),
     ];
 
     let text_rows: Vec<String> = tables.iter()
@@ -115,6 +119,7 @@ fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
         ("DATATYPE", "SYSTABLESPACES", 3, "CHAR(1)", false),
         ("PAGESIZE", "SYSTABLESPACES", 4, "INTEGER", false),
         ("STATE", "SYSTABLESPACES", 5, "CHAR(1)", false),
+        ("BUFFERPOOLID", "SYSTABLESPACES", 6, "INTEGER", false),
         ("NAME", "SYSSCHEMAS", 0, "VARCHAR(128)", false),
         ("NAME", "SYSTABLES", 0, "VARCHAR(128)", false),
         ("SCHEMANAME", "SYSTABLES", 1, "VARCHAR(128)", false),
@@ -126,6 +131,10 @@ fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
         ("ORDINAL", "SYSCOLUMNS", 3, "SMALLINT", false),
         ("TYPENAME", "SYSCOLUMNS", 4, "VARCHAR(20)", false),
         ("NULLABLE", "SYSCOLUMNS", 5, "CHAR(1)", false),
+        ("BPID", "SYSBUFFERPOOLS", 0, "INTEGER", false),
+        ("BPNAME", "SYSBUFFERPOOLS", 1, "VARCHAR(128)", false),
+        ("PAGESIZE", "SYSBUFFERPOOLS", 2, "INTEGER", false),
+        ("NPAGES", "SYSBUFFERPOOLS", 3, "INTEGER", false),
     ];
 
     let text_rows: Vec<String> = cols.iter()
@@ -149,4 +158,32 @@ fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
         .collect();
 
     write_dat(dir, "SYSCOLUMNS", "NAME\tTABNAME\tSCHEMANAME\tORDINAL\tTYPENAME\tNULLABLE", &text_rows, &binary_rows, text_mode)
+}
+
+fn write_sysbufferpools(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
+    let ps = page_size as i32;
+    // (bpid, bpname, pagesize, npages)
+    let data: [(i32, &str, i32, i32); 4] = [
+        (1, "RQDEFAULTBP", ps, 128),
+        (2, "INDEXBP", ps, 64),
+        (3, "LOBBP", ps * 8, 32),
+        (4, "TEMPBP", ps, 64),
+    ];
+
+    let text_rows: Vec<String> = data.iter()
+        .map(|(id, name, pgsz, np)| format!("{id}\t{name}\t{pgsz}\t{np}"))
+        .collect();
+
+    let binary_rows: Vec<Vec<u8>> = data.iter()
+        .map(|(id, name, pgsz, np)| {
+            let mut w = RowWriter::new();
+            w.write_i32(*id);
+            w.write_string(name);
+            w.write_i32(*pgsz);
+            w.write_i32(*np);
+            w.finish()
+        })
+        .collect();
+
+    write_dat(dir, "SYSBUFFERPOOLS", "BPID\tBPNAME\tPAGESIZE\tNPAGES", &text_rows, &binary_rows, text_mode)
 }

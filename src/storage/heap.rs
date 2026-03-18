@@ -3,7 +3,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::storage::page::{PageId, SlotIndex, SlottedPage};
+use crate::storage::page::{
+    PageId, PageRead, PageWrite, SlotIndex, SlottedPage,
+    free_space_of, page_id_of,
+};
 
 /// Physical row address: (page number, slot index within that page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +93,41 @@ impl HeapFile {
         }
         // Update free map.
         self.free_map[page_id as usize] = page.free_space() > 0;
+        Ok(())
+    }
+
+    /// Read a page directly into a caller-provided buffer (zero-allocation).
+    ///
+    /// Used by the buffer pool to read directly into pre-allocated frame memory.
+    /// The caller is responsible for checksum verification.
+    pub fn read_page_into(&mut self, page_id: PageId, buf: &mut [u8]) -> Result<()> {
+        if page_id >= self.page_count {
+            return Err(Error::Corruption(format!(
+                "page {page_id} out of range (file has {} pages)",
+                self.page_count
+            )));
+        }
+        let offset = page_id * self.page_size as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(buf)?;
+        Ok(())
+    }
+
+    /// Write raw page bytes to disk. The page_id is read from the buffer header.
+    ///
+    /// Used by the buffer pool to flush pre-allocated frame memory directly.
+    pub fn write_page_buf(&mut self, buf: &[u8]) -> Result<()> {
+        let page_id = page_id_of(buf);
+        let offset = page_id * self.page_size as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(buf)?;
+        self.file.flush()?;
+
+        if page_id >= self.page_count {
+            self.page_count = page_id + 1;
+            self.free_map.resize(self.page_count as usize, true);
+        }
+        self.free_map[page_id as usize] = free_space_of(buf) > 0;
         Ok(())
     }
 

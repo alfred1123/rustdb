@@ -100,6 +100,7 @@ fn load_table_data(
             let cols = vec![
                 "TBSPACEID".into(), "TBSPACE".into(), "TBSPACETYPE".into(),
                 "DATATYPE".into(), "PAGESIZE".into(), "STATE".into(),
+                "BUFFERPOOLID".into(),
             ];
             let rows: Vec<Vec<Value>> = catalog
                 .tablespaces
@@ -112,6 +113,7 @@ fn load_table_data(
                         Value::Str(ts.datatype.clone()),
                         Value::Integer(ts.pagesize),
                         Value::Str(ts.state.clone()),
+                        Value::Integer(ts.bufferpoolid),
                     ]
                 })
                 .collect();
@@ -161,6 +163,25 @@ fn load_table_data(
                         Value::SmallInt(c.ordinal),
                         Value::Str(c.typename.clone()),
                         Value::Bool(c.nullable),
+                    ]
+                })
+                .collect();
+            Ok((cols, rows))
+        }
+        "SYSBUFFERPOOLS" => {
+            let cols = vec![
+                "BPID".into(), "BPNAME".into(),
+                "PAGESIZE".into(), "NPAGES".into(),
+            ];
+            let rows: Vec<Vec<Value>> = catalog
+                .bufferpools
+                .iter()
+                .map(|bp| {
+                    vec![
+                        Value::Integer(bp.bpid),
+                        Value::Str(bp.bpname.clone()),
+                        Value::Integer(bp.pagesize),
+                        Value::Integer(bp.npages),
                     ]
                 })
                 .collect();
@@ -356,6 +377,7 @@ mod tests {
                     datatype: "A".into(),
                     pagesize: 4096,
                     state: "N".into(),
+                    bufferpoolid: 1,
                 },
             ],
             schemas: vec![Schema { name: "RQSYS".into() }],
@@ -364,7 +386,7 @@ mod tests {
                     name: "SYSTABLESPACES".into(),
                     schemaname: "RQSYS".into(),
                     tbspaceid: 1,
-                    colcount: 6,
+                    colcount: 7,
                 },
             ],
             columns: vec![
@@ -385,6 +407,14 @@ mod tests {
                     nullable: false,
                 },
             ],
+            bufferpools: vec![
+                BufferPool {
+                    bpid: 1,
+                    bpname: "RQDEFAULTBP".into(),
+                    pagesize: 4096,
+                    npages: 128,
+                },
+            ],
         }
     }
 
@@ -393,7 +423,7 @@ mod tests {
         let catalog = test_catalog();
         let stmts = parser::parse("SELECT * FROM SYSTABLESPACES").unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
-        assert_eq!(rs.columns.len(), 6);
+        assert_eq!(rs.columns.len(), 7);
         assert_eq!(rs.rows.len(), 1);
     }
 

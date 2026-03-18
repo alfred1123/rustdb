@@ -17,6 +17,7 @@ pub struct Tablespace {
     pub datatype: String,
     pub pagesize: i32,
     pub state: String,
+    pub bufferpoolid: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +43,19 @@ pub struct Column {
     pub nullable: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct BufferPool {
+    pub bpid: i32,
+    pub bpname: String,
+    pub pagesize: i32,
+    pub npages: i32,
+}
+
 #[derive(Debug)]
 pub struct Catalog {
     pub tablespaces: Vec<Tablespace>,
     pub schemas: Vec<Schema>,
     pub tables: Vec<Table>,
     pub columns: Vec<Column>,
+    pub bufferpools: Vec<BufferPool>,
 }

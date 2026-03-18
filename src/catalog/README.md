@@ -6,7 +6,7 @@ System catalog module — manages the database's internal metadata.
 
 | File           | Purpose                                                    |
 |----------------|------------------------------------------------------------|
-| `types.rs`     | Struct definitions: `Tablespace`, `Schema`, `Table`, `Column`, `Catalog` |
+| `types.rs`     | Struct definitions: `Tablespace`, `Schema`, `Table`, `Column`, `BufferPool`, `Catalog` |
 | `row.rs`       | `RowReader` / `RowWriter` — binary serialization using u64 LE length-prefixed fields |
 | `config.rs`    | `DbConfig` — reads/writes the `admin/SQLDBCONF` database configuration file |
 | `bootstrap.rs` | Creates a fresh database directory with `SQLDBCONF` and system catalog `.DAT` files |
@@ -14,7 +14,7 @@ System catalog module — manages the database's internal metadata.
 
 ## How It Works
 
-1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the four system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`) into `systbsp/` as `.DAT` files.
+1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the five system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`, `SYSBUFFERPOOLS`) into `systbsp/` as `.DAT` files.
 2. **Config** (`config.rs`) reads `SQLDBCONF` on subsequent startups so the engine knows the database's settings.
 3. **Loader** (`loader.rs`) reads those `.DAT` files back, splitting them into rows and deserializing each row with `RowReader`.
 3. The row format is simple: each field is `[u64 LE length][value bytes]`. Types like `SMALLINT` and `INTEGER` are stored as little-endian fixed-width integers; strings are raw UTF-8 bytes; booleans are `Y`/`N` flag bytes.
@@ -69,6 +69,27 @@ Specifies what kind of data can be stored in the tablespace.
 |------|----------------|
 | `Y`  | Nullable       |
 | `N`  | Not nullable   |
+
+### SYSTABLESPACES.BUFFERPOOLID
+
+Each tablespace references a buffer pool by ID. The default mapping is:
+
+| Tablespace | BUFFERPOOLID | Pool Name |
+|------------|-------------|-----------|
+| SYSTBSP    | 1           | RQDEFAULTBP |
+| USERTBSP   | 1           | RQDEFAULTBP |
+| TEMPTBSP   | 4           | TEMPBP |
+
+### SYSBUFFERPOOLS
+
+Defines available buffer pools. Columns: `BPID`, `BPNAME`, `PAGESIZE`, `NPAGES`.
+
+| BPID | BPNAME       | PAGESIZE | NPAGES | Purpose |
+|------|--------------|----------|--------|---------|
+| 1    | RQDEFAULTBP  | 4096     | 128    | Default data pool |
+| 2    | INDEXBP      | 4096     | 64     | Index pages |
+| 3    | LOBBP        | 32768    | 32     | Large objects |
+| 4    | TEMPBP       | 4096     | 64     | Temporary/sort |
 
 ### SQL Type Mappings
 
