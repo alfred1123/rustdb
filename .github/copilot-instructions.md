@@ -43,9 +43,9 @@ Example: `RQSYS.SYSTABLES.0.DAT`
 
 | Table                  | Purpose                             |
 |------------------------|-------------------------------------|
-| RQSYS.SYSTABLESPACES   | Tablespace metadata (id, name, type, page_size, state) |
-| RQSYS.SYSTABLES        | Table metadata (name, schema, tablespace, column count) |
-| RQSYS.SYSCOLUMNS       | Column definitions (name, type, ordinal, nullable)      |
+| RQSYS.SYSTABLESPACES   | Tablespace metadata (tbspaceid, tbspace, tbspacetype, datatype, pagesize, state) |
+| RQSYS.SYSTABLES        | Table metadata (name, schemaname, tbspaceid, colcount) |
+| RQSYS.SYSCOLUMNS       | Column definitions (name, tabname, schemaname, ordinal, typename, nullable) |
 | RQSYS.SYSSCHEMAS       | Schema definitions                  |
 
 All catalog data is stored in a custom binary row format with length-prefixed fields.

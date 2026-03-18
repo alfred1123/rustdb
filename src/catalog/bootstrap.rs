@@ -1,26 +1,28 @@
 use std::fs;
 use std::path::Path;
 
+use crate::catalog::config::DbConfig;
 use crate::catalog::row::RowWriter;
 use crate::error::Result;
-use crate::storage::page::DEFAULT_PAGE_SIZE;
 
 const SCHEMA: &str = "RQSYS";
 
 /// Create a fresh database with system catalog tables.
-pub fn bootstrap(data_dir: &Path, text_mode: bool) -> Result<()> {
+pub fn bootstrap(data_dir: &Path, config: &DbConfig) -> Result<()> {
     for dir in ["systbsp", "usertbsp", "temptbsp", "log", "admin", "backups"] {
         fs::create_dir_all(data_dir.join(dir))?;
     }
     log::debug!("created directory structure under {}", data_dir.display());
 
-    let systbsp = data_dir.join("systbsp");
-    write_systablespaces(&systbsp, text_mode)?;
-    write_sysschemas(&systbsp, text_mode)?;
-    write_systables(&systbsp, text_mode)?;
-    write_syscolumns(&systbsp, text_mode)?;
+    config.write(data_dir)?;
 
-    log::info!("bootstrap complete: 4 catalog tables written");
+    let systbsp = data_dir.join("systbsp");
+    write_systablespaces(&systbsp, config.page_size, config.text_mode)?;
+    write_sysschemas(&systbsp, config.text_mode)?;
+    write_systables(&systbsp, config.text_mode)?;
+    write_syscolumns(&systbsp, config.text_mode)?;
+
+    log::info!("bootstrap complete: SQLDBCONF + 4 catalog tables written");
     Ok(())
 }
 
@@ -45,30 +47,32 @@ fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary
     Ok(())
 }
 
-fn write_systablespaces(dir: &Path, text_mode: bool) -> Result<()> {
-    let data: [(i16, &str, &str, &str); 3] = [
-        (1, "SYSTBSP", "D", "N"),
-        (2, "USERTBSP", "D", "N"),
-        (3, "TEMPTBSP", "T", "N"),
+fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
+    let ps = page_size as i32;
+    let data: [(i32, &str, &str, &str, &str); 3] = [
+        (1, "SYSTBSP", "S", "A", "N"),
+        (2, "USERTBSP", "D", "A", "N"),
+        (3, "TEMPTBSP", "D", "T", "N"),
     ];
 
     let text_rows: Vec<String> = data.iter()
-        .map(|(id, name, t, state)| format!("{id}\t{name}\t{t}\t{}\t{state}", DEFAULT_PAGE_SIZE))
+        .map(|(id, name, tt, dt, state)| format!("{id}\t{name}\t{tt}\t{dt}\t{ps}\t{state}"))
         .collect();
 
     let binary_rows: Vec<Vec<u8>> = data.iter()
-        .map(|(id, name, t, state)| {
+        .map(|(id, name, tt, dt, state)| {
             let mut w = RowWriter::new();
-            w.write_i16(*id);
+            w.write_i32(*id);
             w.write_string(name);
-            w.write_string(t);
-            w.write_i32(DEFAULT_PAGE_SIZE as i32);
+            w.write_string(tt);
+            w.write_string(dt);
+            w.write_i32(ps);
             w.write_string(state);
             w.finish()
         })
         .collect();
 
-    write_dat(dir, "SYSTABLESPACES", "ID\tNAME\tTYPE\tPAGE_SIZE\tSTATE", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSTABLESPACES", "TBSPACEID\tTBSPACE\tTBSPACETYPE\tDATATYPE\tPAGESIZE\tSTATE", &text_rows, &binary_rows, text_mode)
 }
 
 fn write_sysschemas(dir: &Path, text_mode: bool) -> Result<()> {
@@ -79,7 +83,7 @@ fn write_sysschemas(dir: &Path, text_mode: bool) -> Result<()> {
 
 fn write_systables(dir: &Path, text_mode: bool) -> Result<()> {
     let tables: [(&str, i16); 4] = [
-        ("SYSTABLESPACES", 5),
+        ("SYSTABLESPACES", 6i16),
         ("SYSSCHEMAS", 1),
         ("SYSTABLES", 4),
         ("SYSCOLUMNS", 6),
@@ -100,26 +104,27 @@ fn write_systables(dir: &Path, text_mode: bool) -> Result<()> {
         })
         .collect();
 
-    write_dat(dir, "SYSTABLES", "NAME\tSCHEMA_NAME\tTABLESPACE_ID\tCOL_COUNT", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSTABLES", "NAME\tSCHEMANAME\tTBSPACEID\tCOLCOUNT", &text_rows, &binary_rows, text_mode)
 }
 
 fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
     let cols: &[(&str, &str, i16, &str, bool)] = &[
-        ("ID", "SYSTABLESPACES", 0, "SMALLINT", false),
-        ("NAME", "SYSTABLESPACES", 1, "VARCHAR(128)", false),
-        ("TYPE", "SYSTABLESPACES", 2, "CHAR(1)", false),
-        ("PAGE_SIZE", "SYSTABLESPACES", 3, "INTEGER", false),
-        ("STATE", "SYSTABLESPACES", 4, "CHAR(1)", false),
+        ("TBSPACEID", "SYSTABLESPACES", 0, "INTEGER", false),
+        ("TBSPACE", "SYSTABLESPACES", 1, "VARCHAR(128)", false),
+        ("TBSPACETYPE", "SYSTABLESPACES", 2, "CHAR(1)", false),
+        ("DATATYPE", "SYSTABLESPACES", 3, "CHAR(1)", false),
+        ("PAGESIZE", "SYSTABLESPACES", 4, "INTEGER", false),
+        ("STATE", "SYSTABLESPACES", 5, "CHAR(1)", false),
         ("NAME", "SYSSCHEMAS", 0, "VARCHAR(128)", false),
         ("NAME", "SYSTABLES", 0, "VARCHAR(128)", false),
-        ("SCHEMA_NAME", "SYSTABLES", 1, "VARCHAR(128)", false),
-        ("TABLESPACE_ID", "SYSTABLES", 2, "SMALLINT", false),
-        ("COL_COUNT", "SYSTABLES", 3, "SMALLINT", false),
+        ("SCHEMANAME", "SYSTABLES", 1, "VARCHAR(128)", false),
+        ("TBSPACEID", "SYSTABLES", 2, "SMALLINT", false),
+        ("COLCOUNT", "SYSTABLES", 3, "SMALLINT", false),
         ("NAME", "SYSCOLUMNS", 0, "VARCHAR(128)", false),
-        ("TABLE_NAME", "SYSCOLUMNS", 1, "VARCHAR(128)", false),
-        ("SCHEMA_NAME", "SYSCOLUMNS", 2, "VARCHAR(128)", false),
+        ("TABNAME", "SYSCOLUMNS", 1, "VARCHAR(128)", false),
+        ("SCHEMANAME", "SYSCOLUMNS", 2, "VARCHAR(128)", false),
         ("ORDINAL", "SYSCOLUMNS", 3, "SMALLINT", false),
-        ("TYPE_NAME", "SYSCOLUMNS", 4, "VARCHAR(20)", false),
+        ("TYPENAME", "SYSCOLUMNS", 4, "VARCHAR(20)", false),
         ("NULLABLE", "SYSCOLUMNS", 5, "CHAR(1)", false),
     ];
 
@@ -143,5 +148,5 @@ fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
         })
         .collect();
 
-    write_dat(dir, "SYSCOLUMNS", "NAME\tTABLE_NAME\tSCHEMA_NAME\tORDINAL\tTYPE_NAME\tNULLABLE", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSCOLUMNS", "NAME\tTABNAME\tSCHEMANAME\tORDINAL\tTYPENAME\tNULLABLE", &text_rows, &binary_rows, text_mode)
 }

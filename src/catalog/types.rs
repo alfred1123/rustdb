@@ -11,10 +11,11 @@ pub enum DataType {
 
 #[derive(Debug, Clone)]
 pub struct Tablespace {
-    pub id: i16,
-    pub name: String,
-    pub ts_type: String,
-    pub page_size: i32,
+    pub tbspaceid: i32,
+    pub tbspace: String,
+    pub tbspacetype: String,
+    pub datatype: String,
+    pub pagesize: i32,
     pub state: String,
 }
 
@@ -26,18 +27,18 @@ pub struct Schema {
 #[derive(Debug, Clone)]
 pub struct Table {
     pub name: String,
-    pub schema_name: String,
-    pub tablespace_id: i16,
-    pub col_count: i16,
+    pub schemaname: String,
+    pub tbspaceid: i16,
+    pub colcount: i16,
 }
 
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
-    pub table_name: String,
-    pub schema_name: String,
+    pub tabname: String,
+    pub schemaname: String,
     pub ordinal: i16,
-    pub type_name: String,
+    pub typename: String,
     pub nullable: bool,
 }
 

@@ -98,18 +98,19 @@ fn load_table_data(
     match table_ref.table.as_str() {
         "SYSTABLESPACES" => {
             let cols = vec![
-                "ID".into(), "NAME".into(), "TYPE".into(),
-                "PAGE_SIZE".into(), "STATE".into(),
+                "TBSPACEID".into(), "TBSPACE".into(), "TBSPACETYPE".into(),
+                "DATATYPE".into(), "PAGESIZE".into(), "STATE".into(),
             ];
             let rows: Vec<Vec<Value>> = catalog
                 .tablespaces
                 .iter()
                 .map(|ts| {
                     vec![
-                        Value::SmallInt(ts.id),
-                        Value::Str(ts.name.clone()),
-                        Value::Str(ts.ts_type.clone()),
-                        Value::Integer(ts.page_size),
+                        Value::Integer(ts.tbspaceid),
+                        Value::Str(ts.tbspace.clone()),
+                        Value::Str(ts.tbspacetype.clone()),
+                        Value::Str(ts.datatype.clone()),
+                        Value::Integer(ts.pagesize),
                         Value::Str(ts.state.clone()),
                     ]
                 })
@@ -127,8 +128,8 @@ fn load_table_data(
         }
         "SYSTABLES" => {
             let cols = vec![
-                "NAME".into(), "SCHEMA_NAME".into(),
-                "TABLESPACE_ID".into(), "COL_COUNT".into(),
+                "NAME".into(), "SCHEMANAME".into(),
+                "TBSPACEID".into(), "COLCOUNT".into(),
             ];
             let rows: Vec<Vec<Value>> = catalog
                 .tables
@@ -136,9 +137,9 @@ fn load_table_data(
                 .map(|t| {
                     vec![
                         Value::Str(t.name.clone()),
-                        Value::Str(t.schema_name.clone()),
-                        Value::SmallInt(t.tablespace_id),
-                        Value::SmallInt(t.col_count),
+                        Value::Str(t.schemaname.clone()),
+                        Value::SmallInt(t.tbspaceid),
+                        Value::SmallInt(t.colcount),
                     ]
                 })
                 .collect();
@@ -146,8 +147,8 @@ fn load_table_data(
         }
         "SYSCOLUMNS" => {
             let cols = vec![
-                "NAME".into(), "TABLE_NAME".into(), "SCHEMA_NAME".into(),
-                "ORDINAL".into(), "TYPE_NAME".into(), "NULLABLE".into(),
+                "NAME".into(), "TABNAME".into(), "SCHEMANAME".into(),
+                "ORDINAL".into(), "TYPENAME".into(), "NULLABLE".into(),
             ];
             let rows: Vec<Vec<Value>> = catalog
                 .columns
@@ -155,10 +156,10 @@ fn load_table_data(
                 .map(|c| {
                     vec![
                         Value::Str(c.name.clone()),
-                        Value::Str(c.table_name.clone()),
-                        Value::Str(c.schema_name.clone()),
+                        Value::Str(c.tabname.clone()),
+                        Value::Str(c.schemaname.clone()),
                         Value::SmallInt(c.ordinal),
-                        Value::Str(c.type_name.clone()),
+                        Value::Str(c.typename.clone()),
                         Value::Bool(c.nullable),
                     ]
                 })
@@ -349,10 +350,11 @@ mod tests {
         Catalog {
             tablespaces: vec![
                 Tablespace {
-                    id: 1,
-                    name: "SYSTBSP".into(),
-                    ts_type: "D".into(),
-                    page_size: 4096,
+                    tbspaceid: 1,
+                    tbspace: "SYSTBSP".into(),
+                    tbspacetype: "D".into(),
+                    datatype: "A".into(),
+                    pagesize: 4096,
                     state: "N".into(),
                 },
             ],
@@ -360,26 +362,26 @@ mod tests {
             tables: vec![
                 Table {
                     name: "SYSTABLESPACES".into(),
-                    schema_name: "RQSYS".into(),
-                    tablespace_id: 1,
-                    col_count: 5,
+                    schemaname: "RQSYS".into(),
+                    tbspaceid: 1,
+                    colcount: 6,
                 },
             ],
             columns: vec![
                 Column {
-                    name: "ID".into(),
-                    table_name: "SYSTABLESPACES".into(),
-                    schema_name: "RQSYS".into(),
+                    name: "TBSPACEID".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
                     ordinal: 0,
-                    type_name: "SMALLINT".into(),
+                    typename: "INTEGER".into(),
                     nullable: false,
                 },
                 Column {
-                    name: "NAME".into(),
-                    table_name: "SYSTABLESPACES".into(),
-                    schema_name: "RQSYS".into(),
+                    name: "TBSPACE".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
                     ordinal: 1,
-                    type_name: "VARCHAR(128)".into(),
+                    typename: "VARCHAR(128)".into(),
                     nullable: false,
                 },
             ],
@@ -391,16 +393,16 @@ mod tests {
         let catalog = test_catalog();
         let stmts = parser::parse("SELECT * FROM SYSTABLESPACES").unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
-        assert_eq!(rs.columns.len(), 5);
+        assert_eq!(rs.columns.len(), 6);
         assert_eq!(rs.rows.len(), 1);
     }
 
     #[test]
     fn select_specific_columns() {
         let catalog = test_catalog();
-        let stmts = parser::parse("SELECT name, id FROM SYSTABLESPACES").unwrap();
+        let stmts = parser::parse("SELECT tbspace, tbspaceid FROM SYSTABLESPACES").unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
-        assert_eq!(rs.columns, vec!["NAME", "ID"]);
+        assert_eq!(rs.columns, vec!["TBSPACE", "TBSPACEID"]);
         assert_eq!(rs.rows.len(), 1);
     }
 
@@ -417,7 +419,7 @@ mod tests {
     fn select_with_where_eq() {
         let catalog = test_catalog();
         let stmts = parser::parse(
-            "SELECT name FROM SYSTABLESPACES WHERE id = 1",
+            "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 1",
         )
         .unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
@@ -429,7 +431,7 @@ mod tests {
     fn select_with_where_no_match() {
         let catalog = test_catalog();
         let stmts = parser::parse(
-            "SELECT name FROM SYSTABLESPACES WHERE id = 99",
+            "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 99",
         )
         .unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
@@ -440,7 +442,7 @@ mod tests {
     fn select_with_string_where() {
         let catalog = test_catalog();
         let stmts = parser::parse(
-            "SELECT * FROM SYSCOLUMNS WHERE table_name = 'SYSTABLESPACES'",
+            "SELECT * FROM SYSCOLUMNS WHERE tabname = 'SYSTABLESPACES'",
         )
         .unwrap();
         let rs = execute(&stmts[0], &catalog).unwrap();
@@ -510,7 +512,7 @@ mod tests {
     fn error_unsupported_delete() {
         let catalog = test_catalog();
         let stmts =
-            parser::parse("DELETE FROM SYSTABLESPACES WHERE id = 1").unwrap();
+            parser::parse("DELETE FROM SYSTABLESPACES WHERE tbspaceid = 1").unwrap();
         assert_sqlstate(
             execute(&stmts[0], &catalog),
             SqlState::FeatureNotSupported,

@@ -8,6 +8,8 @@ mod transaction;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+use catalog::config::DbConfig;
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .init();
@@ -19,12 +21,21 @@ fn main() -> anyhow::Result<()> {
         .join("systbsp")
         .join("RQSYS.SYSTABLES.0.DAT");
 
-    if !systables_path.exists() {
+    let config = if !systables_path.exists() {
         log::info!("bootstrapping new database at {}", data_dir.display());
-        catalog::bootstrap::bootstrap(&data_dir, text_mode)?;
-    }
+        let cfg = DbConfig {
+            text_mode,
+            ..DbConfig::default()
+        };
+        catalog::bootstrap::bootstrap(&data_dir, &cfg)?;
+        cfg
+    } else {
+        DbConfig::read(&data_dir)?
+    };
+    log::info!("config: PAGESIZE={}, DIAGLEVEL={}, TEXT_MODE={}",
+        config.page_size, config.diag_level, config.text_mode);
 
-    let catalog = catalog::loader::load_catalog(&data_dir, text_mode)?;
+    let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode)?;
 
     println!("RustDB — interactive SQL shell");
     println!("Type SQL queries or \\q to quit.\n");

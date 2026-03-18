@@ -86,11 +86,12 @@ fn load_tablespaces(dir: &Path, text_mode: bool) -> Result<Vec<Tablespace>> {
         read_text_rows(dir, "SYSTABLESPACES")?
             .iter()
             .map(|r| Ok(Tablespace {
-                id: parse_i16(&col(r, 0, "SYSTABLESPACES")?)?,
-                name: col(r, 1, "SYSTABLESPACES")?,
-                ts_type: col(r, 2, "SYSTABLESPACES")?,
-                page_size: parse_i32(&col(r, 3, "SYSTABLESPACES")?)?,
-                state: col(r, 4, "SYSTABLESPACES")?,
+                tbspaceid: parse_i32(&col(r, 0, "SYSTABLESPACES")?)?,
+                tbspace: col(r, 1, "SYSTABLESPACES")?,
+                tbspacetype: col(r, 2, "SYSTABLESPACES")?,
+                datatype: col(r, 3, "SYSTABLESPACES")?,
+                pagesize: parse_i32(&col(r, 4, "SYSTABLESPACES")?)?,
+                state: col(r, 5, "SYSTABLESPACES")?,
             }))
             .collect()
     } else {
@@ -99,10 +100,11 @@ fn load_tablespaces(dir: &Path, text_mode: bool) -> Result<Vec<Tablespace>> {
             .map(|row| {
                 let mut r = RowReader::new(row);
                 Ok(Tablespace {
-                    id: r.read_i16()?,
-                    name: r.read_string()?,
-                    ts_type: r.read_string()?,
-                    page_size: r.read_i32()?,
+                    tbspaceid: r.read_i32()?,
+                    tbspace: r.read_string()?,
+                    tbspacetype: r.read_string()?,
+                    datatype: r.read_string()?,
+                    pagesize: r.read_i32()?,
                     state: r.read_string()?,
                 })
             })
@@ -133,9 +135,9 @@ fn load_tables(dir: &Path, text_mode: bool) -> Result<Vec<Table>> {
             .iter()
             .map(|r| Ok(Table {
                 name: col(r, 0, "SYSTABLES")?,
-                schema_name: col(r, 1, "SYSTABLES")?,
-                tablespace_id: parse_i16(&col(r, 2, "SYSTABLES")?)?,
-                col_count: parse_i16(&col(r, 3, "SYSTABLES")?)?,
+                schemaname: col(r, 1, "SYSTABLES")?,
+                tbspaceid: parse_i16(&col(r, 2, "SYSTABLES")?)?,
+                colcount: parse_i16(&col(r, 3, "SYSTABLES")?)?,
             }))
             .collect()
     } else {
@@ -145,9 +147,9 @@ fn load_tables(dir: &Path, text_mode: bool) -> Result<Vec<Table>> {
                 let mut r = RowReader::new(row);
                 Ok(Table {
                     name: r.read_string()?,
-                    schema_name: r.read_string()?,
-                    tablespace_id: r.read_i16()?,
-                    col_count: r.read_i16()?,
+                    schemaname: r.read_string()?,
+                    tbspaceid: r.read_i16()?,
+                    colcount: r.read_i16()?,
                 })
             })
             .collect()
@@ -160,10 +162,10 @@ fn load_columns(dir: &Path, text_mode: bool) -> Result<Vec<Column>> {
             .iter()
             .map(|r| Ok(Column {
                 name: col(r, 0, "SYSCOLUMNS")?,
-                table_name: col(r, 1, "SYSCOLUMNS")?,
-                schema_name: col(r, 2, "SYSCOLUMNS")?,
+                tabname: col(r, 1, "SYSCOLUMNS")?,
+                schemaname: col(r, 2, "SYSCOLUMNS")?,
                 ordinal: parse_i16(&col(r, 3, "SYSCOLUMNS")?)?,
-                type_name: col(r, 4, "SYSCOLUMNS")?,
+                typename: col(r, 4, "SYSCOLUMNS")?,
                 nullable: col(r, 5, "SYSCOLUMNS")? == "Y",
             }))
             .collect()
@@ -174,10 +176,10 @@ fn load_columns(dir: &Path, text_mode: bool) -> Result<Vec<Column>> {
                 let mut r = RowReader::new(row);
                 Ok(Column {
                     name: r.read_string()?,
-                    table_name: r.read_string()?,
-                    schema_name: r.read_string()?,
+                    tabname: r.read_string()?,
+                    schemaname: r.read_string()?,
                     ordinal: r.read_i16()?,
-                    type_name: r.read_string()?,
+                    typename: r.read_string()?,
                     nullable: r.read_bool()?,
                 })
             })
