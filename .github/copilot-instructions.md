@@ -98,6 +98,12 @@ cargo run -- --data-dir ./TESTDB
    Bootstrap is exempt — it runs outside the WAL since there is no prior state to recover.
 4. **ACID transactions** via WAL + ARIES-style recovery.
 5. **SQL layer** is separate from storage — uses a Volcano-style iterator model.
+6. **Strict page-level latch model.** Buffer pool frames enforce readers–writer
+   exclusion: shared reads allow multiple readers but block writers; exclusive
+   writes block all other access. No uncommitted reads. This is the strict ACID
+   default. Uncommitted-read (`READ UNCOMMITTED` isolation) may be added later
+   as a localised relaxation of the latch check — the enum and guard structure
+   are designed for that extension.
 
 ## Key Dependencies (planned)
 

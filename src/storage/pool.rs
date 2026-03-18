@@ -17,6 +17,21 @@ pub type BufferPoolId = i32;
 /// Index into the frame metadata array.
 type FrameIndex = usize;
 
+/// Access mode for a frame latch (readers–writer).
+///
+/// Strict ACID model: a frame is either shared-read or exclusive-write.
+/// Uncommitted-read (read while exclusive-write held) is not yet supported
+/// and can be added later as a separate isolation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatchMode {
+    /// No active latch — frame is idle or only in LRU.
+    None,
+    /// One or more readers hold the frame (pin_count tracks how many).
+    Shared,
+    /// Exactly one writer holds the frame (pin_count must be 1).
+    Exclusive,
+}
+
 /// Metadata for a single buffer frame. The actual page data lives in
 /// `BufferPool::pool_buf` at offset `frame_index * page_size`.
 struct FrameMeta {
@@ -30,6 +45,8 @@ struct FrameMeta {
     dirty: bool,
     /// Whether this frame currently holds a valid page.
     in_use: bool,
+    /// Current latch mode — enforces readers–writer exclusion.
+    latch: LatchMode,
 }
 
 impl FrameMeta {
@@ -40,6 +57,7 @@ impl FrameMeta {
             pin_count: 0,
             dirty: false,
             in_use: false,
+            latch: LatchMode::None,
         }
     }
 }
@@ -130,7 +148,14 @@ impl BufferPool {
     /// and the requested page is loaded from disk into the pre-allocated frame.
     pub fn fetch_page(&mut self, file_id: FileId, page_id: PageId) -> Result<PageRef<'_>> {
         let frame_idx = self.ensure_loaded(file_id, page_id)?;
+        // Enforce latch: shared read is allowed only when no exclusive writer.
+        if self.frame_meta[frame_idx].latch == LatchMode::Exclusive {
+            return Err(Error::Catalog(format!(
+                "page ({file_id}, {page_id}) is exclusively latched for write"
+            )));
+        }
         self.frame_meta[frame_idx].pin_count += 1;
+        self.frame_meta[frame_idx].latch = LatchMode::Shared;
         // Remove from LRU if present (it's now pinned).
         self.lru.retain(|&i| i != frame_idx);
         let off = frame_idx * self.page_size;
@@ -145,7 +170,15 @@ impl BufferPool {
         page_id: PageId,
     ) -> Result<PageMut<'_>> {
         let frame_idx = self.ensure_loaded(file_id, page_id)?;
-        self.frame_meta[frame_idx].pin_count += 1;
+        // Enforce latch: exclusive write requires no other readers or writers.
+        if self.frame_meta[frame_idx].pin_count > 0 {
+            return Err(Error::Catalog(format!(
+                "page ({file_id}, {page_id}) is already pinned — \
+                 cannot acquire exclusive write latch"
+            )));
+        }
+        self.frame_meta[frame_idx].pin_count = 1;
+        self.frame_meta[frame_idx].latch = LatchMode::Exclusive;
         self.frame_meta[frame_idx].dirty = true;
         self.lru.retain(|&i| i != frame_idx);
         let off = frame_idx * self.page_size;
@@ -171,6 +204,7 @@ impl BufferPool {
         self.frame_meta[frame_idx].pin_count = 1;
         self.frame_meta[frame_idx].dirty = true;
         self.frame_meta[frame_idx].in_use = true;
+        self.frame_meta[frame_idx].latch = LatchMode::Exclusive;
 
         self.page_table.insert((file_id, new_pid), frame_idx);
 
@@ -195,6 +229,7 @@ impl BufferPool {
         }
         self.frame_meta[frame_idx].pin_count -= 1;
         if self.frame_meta[frame_idx].pin_count == 0 {
+            self.frame_meta[frame_idx].latch = LatchMode::None;
             // Add to the back of the LRU list (most-recently used).
             self.lru.push_back(frame_idx);
         }
@@ -272,6 +307,7 @@ impl BufferPool {
         self.frame_meta[frame_idx].pin_count = 0;
         self.frame_meta[frame_idx].dirty = false;
         self.frame_meta[frame_idx].in_use = true;
+        self.frame_meta[frame_idx].latch = LatchMode::None;
 
         self.page_table.insert((file_id, page_id), frame_idx);
         Ok(frame_idx)
@@ -305,6 +341,7 @@ impl BufferPool {
         self.frame_meta[victim].in_use = false;
         self.frame_meta[victim].pin_count = 0;
         self.frame_meta[victim].dirty = false;
+        self.frame_meta[victim].latch = LatchMode::None;
 
         Ok(victim)
     }
@@ -744,5 +781,83 @@ mod tests {
         mgr.create_pool(2, "BP2", 4, PAGE_SIZE).unwrap();
         // flush_all should succeed even with empty pools.
         mgr.flush_all().unwrap();
+    }
+
+    // ── Latch enforcement tests ──
+
+    #[test]
+    fn exclusive_latch_blocks_shared_read() {
+        let mut pool = BufferPool::new("TESTBP", 4, PAGE_SIZE);
+        let (_tmp, fid) = setup_file(&mut pool, "excl_blocks_read", 1);
+
+        // Acquire exclusive write latch.
+        let _page = pool.fetch_page_mut(fid, 0).unwrap();
+
+        // Shared read on the same page must fail.
+        let err = pool.fetch_page(fid, 0).unwrap_err();
+        assert!(err.to_string().contains("exclusively latched"));
+
+        pool.unpin(fid, 0, false).unwrap();
+    }
+
+    #[test]
+    fn shared_read_blocks_exclusive_write() {
+        let mut pool = BufferPool::new("TESTBP", 4, PAGE_SIZE);
+        let (_tmp, fid) = setup_file(&mut pool, "read_blocks_excl", 1);
+
+        // Acquire shared read latch.
+        let _page = pool.fetch_page(fid, 0).unwrap();
+
+        // Exclusive write on the same page must fail.
+        let err = pool.fetch_page_mut(fid, 0).unwrap_err();
+        assert!(err.to_string().contains("exclusive write latch"));
+
+        pool.unpin(fid, 0, false).unwrap();
+    }
+
+    #[test]
+    fn shared_read_allows_multiple_readers() {
+        let mut pool = BufferPool::new("TESTBP", 4, PAGE_SIZE);
+        let (_tmp, fid) = setup_file(&mut pool, "multi_readers", 1);
+
+        // Two shared readers on the same page should succeed.
+        let _p1 = pool.fetch_page(fid, 0).unwrap();
+        pool.unpin(fid, 0, false).unwrap();
+        let _p2 = pool.fetch_page(fid, 0).unwrap();
+        pool.unpin(fid, 0, false).unwrap();
+
+        // Frame pin_count back to 0, latch cleared.
+        let idx = pool.page_table[&(fid, 0)];
+        assert_eq!(pool.frame_meta[idx].latch, LatchMode::None);
+    }
+
+    #[test]
+    fn latch_cleared_after_unpin() {
+        let mut pool = BufferPool::new("TESTBP", 4, PAGE_SIZE);
+        let (_tmp, fid) = setup_file(&mut pool, "latch_clear", 1);
+
+        // Exclusive latch then unpin.
+        let _page = pool.fetch_page_mut(fid, 0).unwrap();
+        pool.unpin(fid, 0, false).unwrap();
+
+        let idx = pool.page_table[&(fid, 0)];
+        assert_eq!(pool.frame_meta[idx].latch, LatchMode::None);
+
+        // Should now be able to acquire shared read.
+        let _page = pool.fetch_page(fid, 0).unwrap();
+        pool.unpin(fid, 0, false).unwrap();
+    }
+
+    #[test]
+    fn new_page_acquires_exclusive_latch() {
+        let mut pool = BufferPool::new("TESTBP", 4, PAGE_SIZE);
+        let (_tmp, fid) = setup_file(&mut pool, "new_page_latch", 0);
+
+        let (pid, _page) = pool.new_page(fid).unwrap();
+        let idx = pool.page_table[&(fid, pid)];
+        assert_eq!(pool.frame_meta[idx].latch, LatchMode::Exclusive);
+
+        pool.unpin(fid, pid, true).unwrap();
+        assert_eq!(pool.frame_meta[idx].latch, LatchMode::None);
     }
 }

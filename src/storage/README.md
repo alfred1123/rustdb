@@ -166,6 +166,15 @@ from disk to check for space. (Can be upgraded to an on-disk bitmap later.)
 5. If no existing page has space → create new page, insert, append to file.
 6. If row exceeds a single page's capacity → return error.
 
+**Planned — Current-page hint:**
+The current linear scan of `free_map` reads pages one-by-one until it finds
+space. A better approach is to cache the **last-insert page ID** per heap file
+so the next insert jumps directly to the page most likely to have room. This
+hint would be maintained by `HeapFile` (or by the tablespace manager) and
+reset when the page fills. For catalog tables that are append-heavy at
+bootstrap, this avoids re-scanning from page 0 on every row. See the
+*Catalog Cache Strategy* section below for the broader caching plan.
+
 ### Tests (8)
 
 - Empty heap creation, insert/read, multi-row same page, page spill,
@@ -196,12 +205,15 @@ no per-page heap allocation occurs on the fetch/evict hot path.
   `capacity * page_size` bytes. Frame `i` occupies
   `pool_buf[i*page_size .. (i+1)*page_size]`.
 - **Metadata-only frames** — `FrameMeta` tracks `file_id`, `page_id`,
-  `pin_count`, `dirty`, `in_use`. No per-frame `SlottedPage` or `Vec<u8>`.
+  `pin_count`, `dirty`, `in_use`, `latch`. No per-frame `SlottedPage` or `Vec<u8>`.
 - **LRU replacement policy** — `VecDeque<FrameIndex>` where front = oldest.
 - **Dirty-page tracking** — frames carry a `dirty: bool` flag; dirty pages
   are flushed to disk before eviction (lazy flush model).
 - **Pin count** — pages in active use are pinned; pinned frames cannot be
   evicted. A frame re-enters the LRU list only when `pin_count` drops to 0.
+- **Frame latch (readers–writer)** — each frame carries a `LatchMode` that
+  enforces strict ACID isolation at the buffer-pool level. See *Frame Latch*
+  section below.
 - **File registration** — `register_file(path, page_size) -> FileId` maps
   `.DAT` files into the pool. Page size is validated against the pool's size.
 
@@ -260,21 +272,103 @@ PageRead (trait)          PageWrite (trait: PageRead)
 
 Pages are **not** flushed synchronously on every write. Instead:
 1. Mutations mark the frame `dirty = true`.
-2. Dirty pages are flushed to disk **lazily** — either:
-   - On **eviction**: when an LRU victim is dirty, it is flushed before reuse.
-   - On **explicit flush**: `flush_page()` or `flush_all()` for checkpoint ops.
-3. This deferred-write model reduces I/O for write-heavy workloads and aligns
+2. Dirty pages are flushed to disk **lazily** via three triggers:
+   - **Eviction** (`evict_for_frame`): when an LRU victim is dirty, it is
+     flushed before the frame is reused for another page.
+   - **Explicit single flush** (`flush_page`): caller specifies a
+     `(file_id, page_id)` to write one dirty page to disk immediately.
+   - **Batch flush** (`flush_all`): iterates all frames and flushes every
+     dirty page — used for checkpoint operations.
+3. All three paths delegate to the internal `flush_frame(idx)` helper, which
+   writes the frame's slice to disk via `HeapFile::write_page_buf()` and
+   clears the `dirty` flag.
+4. This deferred-write model reduces I/O for write-heavy workloads and aligns
    with the WAL contract: the WAL record is written before the data page (later).
+
+### Page Load Path (Disk I/O)
+
+The actual disk read happens inside the `ensure_loaded` internal helper.
+When a page is not already in the pool (cache miss), this is the path:
+
+```
+fetch_page / fetch_page_mut
+  │
+  └─► ensure_loaded(file_id, page_id)
+        │
+        ├─ Fast path: page_table lookup hit → return frame index (no I/O)
+        │
+        └─ Slow path: cache miss
+             │
+             ├─ evict_for_frame()  → find/evict a frame
+             │    ├─ free frame available → use it
+             │    └─ no free frame → pop LRU front (flush if dirty)
+             │
+             ├─ heap.read_page_into(page_id, frame_buf)
+             │    └─ actual disk read into pre-allocated frame slice
+             │
+             ├─ verify_checksum_of(frame_buf)
+             │    └─ CRC32 integrity check on in-place data
+             │
+             └─ update FrameMeta + page_table → return frame index
+```
+
+The disk write path mirrors this: `flush_frame(idx)` writes the frame's
+slice back to disk via `heap.write_page_buf()` and clears the dirty flag.
+
+### Internal Helpers
+
+| Helper | Purpose |
+|--------|---------|
+| `ensure_loaded(file_id, page_id)` | Guarantee page is in a frame; load from disk on cache miss |
+| `evict_for_frame()` | Find a free or evictable frame; flush dirty victim before reuse |
+| `flush_frame(idx)` | Write a single frame to its heap file; clear dirty flag |
+
+These are private to `BufferPool` — all external access goes through the
+public API (`fetch_page`, `fetch_page_mut`, `new_page`, `unpin`, `flush_*`).
 
 ### Eviction Flow
 
 1. Look for a free frame (no page loaded).
 2. If none, pop the **front** of the LRU deque (oldest unpinned frame).
 3. If that frame is dirty → flush to disk first.
-4. Remove old page-table entry, reset frame, return for reuse.
+4. Remove old page-table entry, reset frame (including latch), return for reuse.
 5. If the LRU deque is empty (all frames pinned) → return error.
 
-### Tests (14)
+### Frame Latch (Readers–Writer Exclusion)
+
+Each frame carries a `LatchMode` that enforces **strict ACID isolation** at
+the buffer-pool level. This prevents concurrent read/write conflicts on the
+same page — no uncommitted reads are possible.
+
+```rust
+enum LatchMode {
+    None,       // frame idle — no active pins
+    Shared,     // one or more readers hold the frame
+    Exclusive,  // exactly one writer holds the frame
+}
+```
+
+**Latch rules:**
+
+| Existing latch | `fetch_page` (shared read) | `fetch_page_mut` (exclusive write) |
+|---|---|---|
+| `None` | ✅ Allowed → `Shared` | ✅ Allowed → `Exclusive` |
+| `Shared` (readers active) | ✅ Allowed (pin_count++) | ❌ Rejected — readers active |
+| `Exclusive` (writer active) | ❌ Rejected — writer active | ❌ Rejected — writer active |
+
+- `new_page` always acquires `Exclusive` (the page is freshly created + dirty).
+- `unpin` decrements `pin_count`; when it reaches 0 the latch resets to `None`
+  and the frame re-enters the LRU list.
+- Eviction resets the latch to `None` as part of clearing the frame.
+
+**Design note — future uncommitted-read support:**
+The current model is strict (serializable-level page access). To support
+`READ UNCOMMITTED` isolation later, a new code path could allow `fetch_page`
+when `latch == Exclusive`, returning a read-only view of the in-progress
+dirty page. This was intentionally deferred — the latch enum and check
+structure are designed to make that addition a localised change.
+
+### Tests (19)
 
 - `fetch_and_unpin` — basic fetch + unpin lifecycle
 - `fetch_same_page_twice` — pool hit returns same frame
@@ -290,6 +384,11 @@ Pages are **not** flushed synchronously on every write. Instead:
 - `fetch_mut_marks_dirty` — mutable fetch auto-dirties
 - `page_size_mismatch_rejected` — file with wrong page size rejected
 - `pre_allocated_capacity` — verifies upfront allocation size and name
+- `exclusive_latch_blocks_shared_read` — write latch rejects readers
+- `shared_read_blocks_exclusive_write` — read latch rejects writers
+- `shared_read_allows_multiple_readers` — multiple shared readers coexist
+- `latch_cleared_after_unpin` — latch resets to None on full unpin
+- `new_page_acquires_exclusive_latch` — new page starts with exclusive latch
 
 ### BufferPoolManager
 
@@ -381,6 +480,203 @@ Phase 4 (tablespace.rs)  — depends on Phase 1–3, catalog types
 Phase 5 (migrate catalog)— depends on Phase 4, bootstrap, loader
 Phase 6 (executor wiring)— depends on Phase 4–5, sql/executor
 ```
+
+## Catalog Cache Strategy
+
+Catalog tables (`SYSTABLES`, `SYSCOLUMNS`, `SYSTABLESPACES`, `SYSSCHEMAS`,
+`SYSBUFFERPOOLS`) are read on almost every SQL operation — query planning
+needs column metadata, the executor needs tablespace-to-file mappings, etc.
+Reading them from disk each time is wasteful. The strategy below keeps
+catalog data in memory for fast access while preserving correctness.
+
+### Design
+
+1. **Eager load at startup.** During database open the catalog loader reads
+   all catalog tables once and materializes them into in-memory structures
+   (e.g., `HashMap<(Schema, TableName), TableMeta>`). This is the
+   authoritative cache for the lifetime of the process.
+
+2. **Write-through on DDL.** When a DDL statement (`CREATE TABLE`,
+   `ALTER TABLE`, `DROP TABLE`, etc.) mutates a catalog table, the change
+   is written to disk **and** applied to the in-memory cache in the same
+   operation. No stale reads.
+
+3. **Per-heap current-page hint.** Each cached catalog entry for a heap file
+   stores a `last_insert_page: Option<PageId>` — the last page known to
+   have free space. `insert_row` tries this page first before falling back
+   to the `free_map` scan. The hint is updated after each insert and
+   cleared when the page fills.
+
+4. **Column metadata cache.** Column definitions from `SYSCOLUMNS` are
+   grouped by `(schema, table)` and cached as `Vec<ColumnDef>`. The SQL
+   planner and `RowReader` read from this cache — zero disk I/O for column
+   lookups after startup.
+
+5. **Tablespace → buffer pool routing cache.** The mapping
+   `tbspaceid → BufferPoolId` (from `SYSTABLESPACES`) is cached so that
+   file registrations and page fetches resolve the correct pool without
+   re-reading catalog rows.
+
+### Cache Invalidation Rules
+
+| Event | Action |
+|-------|--------|
+| Startup / bootstrap | Full load from disk into cache |
+| `CREATE TABLE` | Insert into `SYSTABLES` + `SYSCOLUMNS` on disk, add to cache |
+| `DROP TABLE` | Delete from disk, remove from cache |
+| `ALTER TABLE ADD COLUMN` | Update disk rows, append to cached column list |
+| `CREATE TABLESPACE` | Insert into `SYSTABLESPACES` on disk, add to routing cache |
+| Buffer pool eviction | No cache impact — cache is separate from page frames |
+
+Because RustDB is currently single-session, there is no cross-session
+invalidation concern. When multi-session support is added, the cache
+will need a latch or read-copy-update (RCU) scheme.
+
+### Dependency
+
+The catalog cache sits between the **catalog loader** and the **SQL executor /
+tablespace manager**. It does not replace the buffer pool — catalog *pages*
+still flow through the buffer pool for I/O; the cache holds *deserialized*
+rows for fast lookup.
+
+```
+SQL executor / planner
+        │
+        ▼
+  Catalog Cache  (in-memory HashMap of deserialized catalog rows)
+        │  (miss on startup only — full eager load)
+        ▼
+  Catalog Loader  (reads raw row bytes via buffer pool)
+        │
+        ▼
+  Buffer Pool → Heap File → Disk
+```
+
+## Future Development Options
+
+RustDB follows DB2-style conventions. The table below compares the current
+approach with Oracle-style alternatives that could be adopted if workload
+demands justify the added complexity.
+
+### Buffer Pool: Named Pools vs Shared Cache
+
+| | Current (DB2-style) | Alternative (Oracle-style) |
+|---|---|---|
+| **Design** | Per-tablespace named pools (`RQDEFAULTBP`, `INDEXBP`, …) | Single shared buffer cache with optional `KEEP`/`RECYCLE` sub-pools |
+| **Pro** | Workload isolation — catalog pages can't evict hot user data | Auto-adapts to shifting workloads without manual sizing |
+| **Con** | Must size pools upfront; idle memory in one pool can't help another | Less predictable per-workload performance; more complex eviction logic |
+
+**Potential upgrade:** Add a dynamic rebalancing layer that can shrink idle
+pools and grow busy ones at runtime, getting the isolation benefits with
+better memory utilisation.
+
+### Eviction Policy: LRU vs Alternative Mechanisms
+
+RustDB currently uses strict LRU via `VecDeque<FrameIndex>`. LRU is the
+industry-standard default, but production databases adapt it to specific
+workload patterns. The table below compares alternatives that could be
+adopted if profiling reveals LRU limitations.
+
+| Mechanism | Used By | Situation | Why Used |
+|-----------|---------|-----------|----------|
+| **Strict LRU** | SQLite, RustDB (current) | Small to medium pools, embedded databases | Simplest to implement; good default for general workloads |
+| **CLOCK (circular LRU)** | PostgreSQL | Large buffer pools with high throughput | Approximates LRU with O(1) eviction — avoids moving entries in a linked list on every access; uses a reference bit swept by a clock hand |
+| **LRU-K** | Microsoft SQL Server | Mixed OLTP/OLAP with repeated sequential scans | Tracks the last K accesses per page; a single sequential scan doesn't pollute the cache because pages need multiple hits to become "hot" |
+| **Midpoint Insertion (Young/Old LRU)** | MySQL InnoDB | Full-table scans mixed with point lookups | New pages enter at the midpoint (3/8 from tail); only pages re-accessed after a configurable interval promote to the "young" head — prevents scan floods from evicting hot pages |
+| **Touch Count + Hot/Cold Lists** | Oracle DB | High-concurrency OLTP with many concurrent sessions | Tracks touch count per buffer; splits cache into hot and cold ends; avoids LRU list contention under thousands of concurrent latches |
+| **MRU (Most Recently Used)** | IBM DB2 (configurable) | Large sequential scans (e.g., `FETCH FIRST` over a massive table) | After a full scan the *most* recently read pages are least likely to be reused — evicting them first keeps earlier (potentially re-scanned) pages resident |
+| **LFU (Least Frequently Used)** | Rare; research systems, some caching layers | Stable hot-set workloads with long-lived popular pages | Evicts the least-accessed page overall; excellent when the hot set is small and stable, but slow to adapt when access patterns shift |
+| **ARC (Adaptive Replacement Cache)** | ZFS, IBM DS8000 | Workloads that shift between recency-friendly and frequency-friendly patterns | Self-tuning hybrid of LRU and LFU; dynamically adjusts the split between recent-once and recent-many lists without manual configuration |
+| **2Q (Two-Queue)** | Research, some storage engines | Scan-resistant caching with minimal tuning | Incoming pages go to a short FIFO queue; only pages re-accessed within the FIFO window promote to a main LRU queue — cheap scan resistance |
+
+**Potential upgrade path for RustDB:**
+
+1. **Near-term — CLOCK sweep.** Replace the `VecDeque` LRU with a circular
+   buffer + reference bit. This eliminates the O(n) `retain()` calls on
+   every `fetch_page` / `fetch_page_mut` while preserving LRU-like behavior.
+   Minimal API change — only internal eviction logic changes.
+
+2. **Medium-term — Midpoint insertion.** Split the LRU deque into young/old
+   regions (configurable ratio, e.g., 5/8 young). New loads enter the old
+   region; re-access within a time window promotes to young. This protects
+   hot catalog pages from being evicted by sequential scans.
+
+3. **Long-term — Per-pool policy selection.** Allow each `BufferPool` to
+   specify its eviction policy at creation (`LRU`, `CLOCK`, `MRU`, etc.).
+   Scan-heavy temporary tablespaces can use MRU while OLTP data pools use
+   CLOCK or midpoint LRU — matching DB2's configurable approach.
+
+**Current assessment:** Strict LRU is correct and sufficient for the current
+single-session, low-concurrency stage. The `VecDeque` implementation is easy
+to reason about and test. Upgrading to CLOCK is the natural first step when
+profiling shows `retain()` overhead or scan pollution becomes measurable.
+
+### Free-Space Tracking: In-Memory `Vec<bool>` vs On-Disk Bitmaps
+
+| | Current | Alternative (Oracle ASSM-style) |
+|---|---|---|
+| **Design** | In-memory boolean per page + planned current-page hint | On-disk bitmap blocks with graduated fullness levels (0–25%, 25–50%, etc.) |
+| **Pro** | Trivial to implement and understand | Survives crash; scales to millions of pages; low insert contention |
+| **Con** | Lost on crash (rebuilt optimistically); linear O(n) scan | Bitmap blocks consume space; L1/L2/L3 tree adds implementation cost |
+
+**Potential upgrade (incremental):**
+1. **Near-term:** Persist the free map as a header page (page 0) in each
+   `.DAT` file — gives crash durability without full ASSM complexity.
+2. **Medium-term:** Upgrade to a 2-bit-per-page encoding
+   (empty / <50% / <75% / full) to reduce wasted probes on insert.
+3. **Long-term:** Full bitmap tree (ASSM-style) when page counts reach
+   hundreds of thousands.
+
+### Delete Model: Tombstone vs In-Place Delete + Undo
+
+| | Current | Alternative (Oracle-style) |
+|---|---|---|
+| **Design** | Tombstone slot `(offset=0, length=0)`; dead bytes remain until compaction | In-place delete with undo segment; space reclaimable immediately |
+| **Pro** | Simple, testable; natural fit for MVCC (old versions stay in place) | Immediate space reuse within the same block by other transactions |
+| **Con** | Dead space accumulates; needs future `REORG` / compaction pass | Requires undo segments, ITL entries, and concurrency control for block-level contention |
+
+**Potential upgrade:** Implement an online page compaction (`REORG`) that
+reclaims tombstoned space without blocking readers. This closes the space
+gap without the full undo-segment machinery.
+
+### Row Addressing: RID vs Self-Contained ROWID
+
+| | Current | Alternative (Oracle-style) |
+|---|---|---|
+| **Design** | `RID(page_id, slot_index)` — two integers, resolved via tablespace manager | `ROWID(object_id, file#, block#, row#)` — self-contained physical address |
+| **Pro** | Simple; slot directory enables in-page reorg without changing RIDs | Any layer can resolve the physical location without a catalog lookup |
+| **Con** | Requires external lookup to find which `.DAT` file a RID belongs to | 10-byte encoding; tightly couples address to physical layout; row migration invalidates ROWIDs |
+
+**Current assessment:** With one heap file per table, the simpler RID is
+sufficient. A self-contained ROWID would only pay off with multiple
+datafiles per tablespace, which is not currently in scope.
+
+### Recovery: ARIES WAL vs Redo + Undo Split
+
+| | Current (ARIES) | Alternative (Oracle-style) |
+|---|---|---|
+| **Design** | Single WAL handles both redo and undo | Separate redo log + undo tablespace |
+| **Pro** | One log, one recovery algorithm; well-studied with clear correctness proofs | Undo segments provide read consistency for free; redo log can be smaller |
+| **Con** | WAL grows larger under long-running transactions; read-consistent snapshots need a separate version store | Two subsystems to size and manage; `ORA-01555: snapshot too old` when undo undersized |
+
+**Current assessment:** ARIES is the right foundation — it gets RustDB to
+correct ACID transactions with minimal code. If high-concurrency OLTP demands
+it later, a version store layered alongside the WAL can provide Oracle-style
+read consistency without abandoning the single-log model.
+
+### Summary
+
+| Area | Current approach | Complexity | Performance ceiling |
+|------|-----------------|------------|-------------------|
+| Buffer pools | Named, per-tablespace | Low | Medium (manual tuning) |
+| Free-space map | In-memory `Vec<bool>` | Trivial | Low (linear scan, lost on crash) |
+| Deletes | Tombstone | Low | Medium (needs compaction) |
+| Row addressing | `RID(page, slot)` | Low | Sufficient for single-file tables |
+| Recovery | ARIES WAL | Medium | High (proven at scale) |
+
+The DB2-style architecture prioritises **correctness, testability, and
+simplicity** first. Each area above has a clear upgrade path when real
+workload data reveals the bottleneck — no premature optimisation required.
 
 ## New Dependencies
 

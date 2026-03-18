@@ -275,6 +275,7 @@ impl PageRead for PageRef<'_> {
 ///
 /// Created by `BufferPool::fetch_page_mut` and `BufferPool::new_page`.
 /// The slice lives in the pool's pre-allocated memory region.
+#[derive(Debug)]
 pub struct PageMut<'a> {
     buf: &'a mut [u8],
 }
