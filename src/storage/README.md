@@ -6,6 +6,7 @@ Page-based storage engine.
 
 | File             | Purpose                                         |
 |------------------|-------------------------------------------------|
+| `fsm.rs`         | Free Space Map: binary max-heap for O(log P) free-space search and update, `.FSM` file persistence |
 | `page.rs`        | Slotted page: 24-byte header, slot directory, row data, CRC32 checksums |
 | `heap.rs`        | Heap file: manages a `.DAT` file as a sequence of slotted pages, RID addressing |
 | `pool.rs`        | Buffer pool: fixed-size frame pool, LRU eviction, dirty-page tracking, pin counts |
@@ -128,23 +129,54 @@ physical address used by the buffer pool and future index layer.
 Page N lives at file offset `N * page_size`. Pages are read/written
 individually via seeking.
 
-### Free-Space Directory
+### Free Space Map (FSM)
 
-An in-memory `Vec<u16>` tracks the **actual free bytes** available in each page:
+Each heap file is accompanied by a **Free Space Map** (`FreeSpaceMap` in
+`fsm.rs`) — a binary max-heap that tracks per-page free space as 1-byte
+categories (0–255). This replaces the previous `Vec<u16>` + hint approach.
 
-| Event | Effect |
-|-------|--------|
-| File opened | All existing pages set to `page_size - HEADER_SIZE` (optimistic) |
-| After `write_page` / `write_page_buf` | Updated to `page.free_space()` (exact value) |
-| Insert fails on a page | Corrected to actual `page.free_space()` |
+**Category encoding:**
 
-On insert, pages where `free_space[pid] < row.len()` are skipped **without
-reading from disk**. This is a key improvement over the previous `Vec<bool>`
-approach which could only say "might have space" and required a disk read to
-find out.
+```
+category = free_bytes × 256 / page_size
+```
 
-A `next_free_hint: usize` tracks the first page likely to have space, so
-inserts don't re-scan from page 0 every time.
+For 4096-byte pages, each category step ≈ 16 bytes.
+Category 255 = nearly empty page, category 0 = full.
+
+**Tree layout (array-based binary heap):**
+
+```
+         [root]         max of entire file
+        /      \
+    [left]   [right]    max of children
+    / \       / \
+  L0  L1    L2  L3      leaf = category of one data page
+```
+
+Leaf nodes start at index `leaf_count - 1`. Leaf at index
+`leaf_offset + pid` corresponds to data page `pid`.
+
+| Operation | Complexity | Description |
+|-----------|------------|-------------|
+| `search(needed)` | O(log P) | Walk root-to-leaf, prefer left child |
+| `update(pid, free_bytes)` | O(log P) | Set leaf category, bubble up |
+| `extend(new_count)` | O(P) | Grow tree for new pages |
+| `save(path)` | O(P) | Persist to `.FSM` file |
+| `load(path)` | O(P) | Restore from `.FSM` file |
+
+**File format (`.FSM`):**
+
+```
+[page_size: u32 LE][page_count: u32 LE][categories: page_count bytes]
+```
+
+Only leaf categories are persisted — internal nodes are rebuilt on load.
+
+**Lifecycle:**
+- On `open()`: load from `.FSM` file if present, else create optimistic.
+- On insert/delete/write: `update()` corrects the page's category.
+- On `flush_all()`: FSM is saved to disk alongside dirty pages.
 
 ### Public API
 
@@ -159,27 +191,19 @@ inserts don't re-scan from page 0 every time.
 | `read_row` | `(&mut self, Rid) -> Result<Vec<u8>>` | Fetch row by RID |
 | `delete_row` | `(&mut self, Rid) -> Result<bool>` | Tombstone a row |
 | `scan` | `(&mut self) -> Result<Vec<(Rid, Vec<u8>)>>` | All live rows across all pages |
+| `save_fsm` | `(&self) -> Result<()>` | Persist FSM to `.FSM` file |
 | `page_count` | `(&self) -> u64` | Number of pages in the file |
 | `page_size` | `(&self) -> usize` | Page size for this heap |
 
 ### Insert Flow
 
-1. Start from `next_free_hint`, wrap around through all pages.
-2. Skip pages where `free_space[pid] < row.len()` — **no disk read**.
-3. Read candidate page, attempt `page.insert_row(row)`.
-4. If it fits → write page back, update `next_free_hint`, return RID.
-5. If not → correct `free_space[pid]` to actual value, track best-seen
-   free space. If this page has more free space than any previously seen,
-   record it as the best candidate.
-6. If no existing page has space → set `next_free_hint` to the page with
-   the most free space seen during the scan, then create a new page,
-   insert, and append to file.
-7. If row exceeds a single page's capacity → return error.
-
-The **best-seen hint** ensures `next_free_hint` always points to the page
-with the most free space observed during the scan — not just the last
-inserted page. This improves space reuse in fragmented tables at zero cost
-(one integer comparison per page touched).
+1. Query the FSM: `fsm.search(needed_bytes)` — **O(log P)** root-to-leaf walk.
+2. If a candidate page is found:
+   a. Read the page, attempt `page.insert_row(row)`.
+   b. If it fits → write page, update FSM, return RID.
+   c. If not (optimistic category was wrong) → correct FSM, retry search.
+3. If no page qualifies → create a new page, insert, extend FSM.
+4. If row exceeds a single page's capacity → return error.
 
 ### Tests (8)
 
@@ -479,33 +503,26 @@ SQL Executor / Catalog
 | `insert_row` | `(&mut self, schema, table, &[u8]) -> Result<Rid>` | Insert row, return RID |
 | `read_row` | `(&mut self, schema, table, Rid) -> Result<Vec<u8>>` | Read one row by RID |
 | `delete_row` | `(&mut self, schema, table, Rid) -> Result<bool>` | Tombstone a row |
-| `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages in all pools |
+| `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages in all pools + persist FSMs |
 | `pool_manager` | `(&self) -> &BufferPoolManager` | Read-only access for diagnostics |
 
-### Insert Flow (Free-Space Directory)
+### Insert Flow (Free Space Map)
 
-Each `TableFileInfo` maintains a per-page free-space directory (`Vec<u16>`)
-and a `next_free_hint` pointing to the first page likely to have space.
+Each `TableFileInfo` maintains a `FreeSpaceMap` (binary max-heap) that
+tracks per-page free space as 1-byte categories.
 
-1. Resolve `(schema, table)` → `TableFileInfo` (pool_id, file_id, free-space dir).
-2. Scan from `next_free_hint`, wrapping around. For each page, check
-   `free_space[pidx]` against the row size — **no latch required**.
-3. Skip pages where the directory says there isn't enough space.
-4. On a candidate page: `fetch_page_mut` (exclusive latch), attempt insert.
-   - Success: unpin dirty, update directory entry, advance hint, return RID.
-   - Failure (concurrent fill): update directory entry, unpin clean, continue.
-5. If no existing page fits: `new_page`, insert, extend directory.
-6. If row exceeds page capacity: return error.
+1. Resolve `(schema, table)` → `TableFileInfo` (pool_id, file_id, FSM).
+2. Query the FSM: `fsm.search(needed_bytes)` — **O(log P)**.
+3. If a candidate page is found:
+   a. `fetch_page_mut` (exclusive latch), attempt insert.
+   b. Success: unpin dirty, update FSM, return RID.
+   c. Failure (optimistic category was wrong): update FSM, unpin, retry.
+4. If no page qualifies: `new_page`, insert, extend FSM.
+5. If row exceeds page capacity: return error.
 
-The directory eliminates the old shared-read probe and its latch gap
-(shared-check → unpin → exclusive-write where another thread could fill
-the page). Pages are skipped entirely via the in-memory directory.
-
-During the scan, each page touched updates a **best-seen** tracker. If no
-existing page fits, `next_free_hint` is set to the page with the most free
-space observed — so the next insert starts at the best candidate rather
-than the last page checked. This improves space reuse in fragmented tables
-at zero cost (one integer comparison per page touched).
+The FSM eliminates both the O(N) linear scan and the need for a best-seen
+hint tracker. Each search is O(log P) with no page reads for rejected
+candidates.
 
 ### Scan Flow
 

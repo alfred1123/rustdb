@@ -1,11 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::storage::fsm::FreeSpaceMap;
 use crate::storage::page::{
     PageId, PageRead, PageWrite, SlotIndex, SlottedPage,
-    PAGE_HEADER_SIZE, free_space_of, page_id_of,
+    free_space_of, page_id_of,
 };
 
 /// Physical row address: (page number, slot index within that page).
@@ -23,17 +24,17 @@ pub struct HeapFile {
     page_size: usize,
     /// Total number of pages currently in the file.
     page_count: u64,
-    /// Per-page free-space directory: tracks usable bytes available in each page.
-    /// Inserts compare `free_space[pid] >= row.len()` to skip pages that
-    /// definitely cannot hold the row — no disk read required.
-    free_space: Vec<u16>,
-    /// Hint: index of the first page likely to have free space.
-    /// Avoids re-scanning from page 0 on every insert.
-    next_free_hint: usize,
+    /// Binary max-heap free-space map. O(log P) search and update.
+    fsm: FreeSpaceMap,
+    /// Path to the `.FSM` file (derived from the `.DAT` path).
+    fsm_path: PathBuf,
 }
 
 impl HeapFile {
     /// Open an existing heap file or create a new one.
+    ///
+    /// Loads the FSM from the corresponding `.FSM` file if it exists,
+    /// otherwise creates a new one with optimistic categories.
     pub fn open(path: &Path, page_size: usize) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -49,17 +50,24 @@ impl HeapFile {
             0
         };
 
-        // Optimistic: assume existing pages have maximum usable space.
-        // The first real insert will read the page and correct the value.
-        let max_usable = if page_size > PAGE_HEADER_SIZE { page_size - PAGE_HEADER_SIZE } else { 0 };
-        let free_space = vec![max_usable as u16; page_count as usize];
+        let fsm_path = path.with_extension("FSM");
+        let fsm = match FreeSpaceMap::load(&fsm_path)? {
+            Some(mut loaded) => {
+                // File may have grown since last save.
+                if (page_count as usize) > loaded.page_count() {
+                    loaded.extend(page_count as usize);
+                }
+                loaded
+            }
+            None => FreeSpaceMap::new(page_count as usize, page_size),
+        };
 
         Ok(Self {
             file,
             page_size,
             page_count,
-            free_space,
-            next_free_hint: 0,
+            fsm,
+            fsm_path,
         })
     }
 
@@ -97,10 +105,10 @@ impl HeapFile {
         // Update page_count if this extends the file.
         if page_id >= self.page_count {
             self.page_count = page_id + 1;
-            self.free_space.resize(self.page_count as usize, 0);
+            self.fsm.extend(self.page_count as usize);
         }
-        // Record actual free space.
-        self.free_space[page_id as usize] = page.free_space() as u16;
+        // Record actual free space in the FSM.
+        self.fsm.update(page_id as usize, page.free_space());
         Ok(())
     }
 
@@ -133,54 +141,34 @@ impl HeapFile {
 
         if page_id >= self.page_count {
             self.page_count = page_id + 1;
-            self.free_space.resize(self.page_count as usize, 0);
+            self.fsm.extend(self.page_count as usize);
         }
-        self.free_space[page_id as usize] = free_space_of(buf) as u16;
+        self.fsm.update(page_id as usize, free_space_of(buf));
         Ok(())
     }
 
     /// Insert a row into the heap, returning its RID.
     ///
-    /// Uses the free-space directory to skip pages that cannot hold the row
-    /// (no disk read needed). Starts from `next_free_hint` to avoid
-    /// re-scanning known-full pages.
+    /// Uses the FSM binary max-heap to find a page with enough free
+    /// space in **O(log P)**. Falls back to allocating a new page if
+    /// no existing page qualifies.
     pub fn insert_row(&mut self, row: &[u8]) -> Result<Rid> {
         let needed = row.len();
 
-        // Track the page with the most free space seen during the scan
-        // so the hint points to the best candidate for the next insert.
-        let mut best_free: usize = 0;
-        let mut best_page: usize = self.next_free_hint;
-
-        // Scan from the hint forward, then wrap around.
-        let count = self.page_count as usize;
-        for i in 0..count {
-            let pid = ((self.next_free_hint + i) % count) as u64;
-            // Skip pages that definitely cannot hold this row.
-            if (self.free_space[pid as usize] as usize) < needed {
-                continue;
-            }
-            let mut page = self.read_page(pid)?;
+        // O(log P) search for a candidate page.
+        while let Some(pid) = self.fsm.search(needed) {
+            let page_id = pid as u64;
+            let mut page = self.read_page(page_id)?;
             if let Some(slot) = page.insert_row(row) {
                 self.write_page(&page)?;
-                // Advance hint to this page (it may still have room).
-                self.next_free_hint = pid as usize;
                 return Ok(Rid {
-                    page_id: pid,
+                    page_id,
                     slot,
                 });
             }
-            // Page didn't have enough room after all — correct its free space.
-            let actual = page.free_space();
-            self.free_space[pid as usize] = actual as u16;
-            if actual > best_free {
-                best_free = actual;
-                best_page = pid as usize;
-            }
+            // Optimistic category was wrong — correct it and retry.
+            self.fsm.update(pid, page.free_space());
         }
-
-        // Update hint to the best page seen before allocating new.
-        self.next_free_hint = best_page;
 
         // No existing page has space — append a new one.
         let new_pid = self.page_count;
@@ -189,7 +177,6 @@ impl HeapFile {
             .insert_row(row)
             .ok_or_else(|| Error::Catalog("row too large for a single page".into()))?;
         self.write_page(&page)?;
-        self.next_free_hint = new_pid as usize;
         Ok(Rid {
             page_id: new_pid,
             slot,
@@ -238,6 +225,11 @@ impl HeapFile {
         }
         Ok(rows)
     }
+
+    /// Persist the FSM to its `.FSM` file.
+    pub fn save_fsm(&self) -> Result<()> {
+        self.fsm.save(&self.fsm_path)
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +249,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!("rustdb_test_{name}"));
             // Remove if leftover from a previous run.
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path.with_extension("FSM"));
             Self { path }
         }
     }
@@ -264,6 +257,7 @@ mod tests {
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.path.with_extension("FSM"));
         }
     }
 

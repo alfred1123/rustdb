@@ -1,24 +1,21 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::catalog::cache::CatalogCache;
 use crate::error::{Error, Result};
+use crate::storage::fsm::FreeSpaceMap;
 use crate::storage::heap::Rid;
-use crate::storage::page::{PageRead, PageWrite, PAGE_HEADER_SIZE};
+use crate::storage::page::{PageRead, PageWrite};
 use crate::storage::pool::{BufferPoolId, BufferPoolManager, FileId};
 
 /// Routing info for one table's data file.
 struct TableFileInfo {
     pool_id: BufferPoolId,
     file_id: FileId,
-    /// Per-page free-space directory: tracks usable bytes in each page.
-    /// Inserts skip pages where `free_space[pid] < row.len()` without
-    /// acquiring any latch.
-    free_space: Vec<u16>,
-    /// Hint: first page likely to have free space.
-    next_free_hint: usize,
-    /// Page size for this table's tablespace (needed for optimistic init).
-    page_size: usize,
+    /// Binary max-heap free-space map. O(log P) search and update.
+    fsm: FreeSpaceMap,
+    /// Path to the `.FSM` file for persistence.
+    fsm_path: PathBuf,
 }
 
 /// Central coordinator mapping (schema, table) to heap files and routing all
@@ -80,24 +77,31 @@ impl TablespaceManager {
             })?;
 
             let dat_path = dir.join(format!("{}.{}.0.DAT", table.schemaname, table.name));
+            let fsm_path = dat_path.with_extension("FSM");
             let page_size = ts.pagesize as usize;
             let pool_id = ts.bufferpoolid;
 
             let file_id = pool_manager.register_file(pool_id, &dat_path, page_size)?;
 
-            // Optimistic free-space directory: assume existing pages have
-            // maximum usable space. Corrected on first real insert.
+            // Load FSM from disk or create optimistic one.
             let file_pages = pool_manager.get(pool_id)?.file_page_count(file_id)? as usize;
-            let max_usable = if page_size > PAGE_HEADER_SIZE { page_size - PAGE_HEADER_SIZE } else { 0 };
+            let fsm = match FreeSpaceMap::load(&fsm_path)? {
+                Some(mut loaded) => {
+                    if file_pages > loaded.page_count() {
+                        loaded.extend(file_pages);
+                    }
+                    loaded
+                }
+                None => FreeSpaceMap::new(file_pages, page_size),
+            };
 
             table_files.insert(
                 (table.schemaname.clone(), table.name.clone()),
                 TableFileInfo {
                     pool_id,
                     file_id,
-                    free_space: vec![max_usable as u16; file_pages],
-                    next_free_hint: 0,
-                    page_size,
+                    fsm,
+                    fsm_path,
                 },
             );
         }
@@ -151,9 +155,9 @@ impl TablespaceManager {
 
     /// Insert a row into a table, returning its RID.
     ///
-    /// Uses the free-space directory to skip full pages without any latch.
-    /// Goes directly to `fetch_page_mut` (exclusive) on candidates.
-    /// Starts from `next_free_hint` to avoid re-scanning known-full pages.
+    /// Uses the FSM binary max-heap to find a page with enough free
+    /// space in **O(log P)**. Falls back to allocating a new page if
+    /// no existing page qualifies.
     pub fn insert_row(
         &mut self,
         schema: &str,
@@ -168,58 +172,37 @@ impl TablespaceManager {
         })?;
         let pool_id = info.pool_id;
         let file_id = info.file_id;
-        let hint = info.next_free_hint;
         let needed = row.len();
-        // Release immutable borrow before the loop so we can get_mut later.
 
-        let pool = self.pool_manager.get_mut(pool_id)?;
-        let page_count = pool.file_page_count(file_id)? as usize;
-
-        // Track the page with the most free space seen during the scan
-        // so the hint points to the best candidate for the next insert.
-        let mut best_free: usize = 0;
-        let mut best_page: usize = hint;
-
-        // Scan from hint, wrap around. Use free-space dir to skip full pages.
-        for i in 0..page_count {
-            let pidx = (hint + i) % page_count;
-            let pid = pidx as u64;
-
-            let dir_free = self.table_files.get(&key).unwrap().free_space[pidx] as usize;
-            if dir_free < needed {
-                continue;
-            }
+        // O(log P) search loop — retry if optimistic category was wrong.
+        loop {
+            let pid = match self.table_files.get(&key).unwrap().fsm.search(needed) {
+                Some(p) => p,
+                None => break, // no candidate → allocate new page
+            };
+            let page_id = pid as u64;
 
             let pool = self.pool_manager.get_mut(pool_id)?;
             let result: Option<u16>;
             let actual_free: usize;
             {
-                let mut page = pool.fetch_page_mut(file_id, pid)?;
+                let mut page = pool.fetch_page_mut(file_id, page_id)?;
                 result = page.insert_row(row);
                 actual_free = page.free_space();
             }
 
-            let info = self.table_files.get_mut(&key).unwrap();
             if let Some(slot) = result {
                 let pool = self.pool_manager.get_mut(pool_id)?;
-                pool.unpin(file_id, pid, true)?;
-                info.free_space[pidx] = actual_free as u16;
-                info.next_free_hint = pidx;
-                return Ok(Rid { page_id: pid, slot });
+                pool.unpin(file_id, page_id, true)?;
+                let info = self.table_files.get_mut(&key).unwrap();
+                info.fsm.update(pid, actual_free);
+                return Ok(Rid { page_id, slot });
             }
-            // Insert failed — correct free space, move on.
+            // Insert failed — correct FSM and retry.
             let pool = self.pool_manager.get_mut(pool_id)?;
-            pool.unpin(file_id, pid, false)?;
-            info.free_space[pidx] = actual_free as u16;
-            if actual_free > best_free {
-                best_free = actual_free;
-                best_page = pidx;
-            }
-        }
-
-        // Update hint to the best page seen before allocating new.
-        if let Some(info) = self.table_files.get_mut(&key) {
-            info.next_free_hint = best_page;
+            pool.unpin(file_id, page_id, false)?;
+            let info = self.table_files.get_mut(&key).unwrap();
+            info.fsm.update(pid, actual_free);
         }
 
         // No existing page has space — allocate a new one.
@@ -238,12 +221,8 @@ impl TablespaceManager {
         pool.unpin(file_id, new_pid, true)?;
 
         let info = self.table_files.get_mut(&key).unwrap();
-        // Extend directory for the new page.
-        if new_pid as usize >= info.free_space.len() {
-            info.free_space.resize(new_pid as usize + 1, 0);
-        }
-        info.free_space[new_pid as usize] = actual_free as u16;
-        info.next_free_hint = new_pid as usize;
+        info.fsm.extend(new_pid as usize + 1);
+        info.fsm.update(new_pid as usize, actual_free);
 
         Ok(Rid {
             page_id: new_pid,
@@ -306,19 +285,20 @@ impl TablespaceManager {
         }
         pool.unpin(file_id, rid.page_id, deleted)?;
 
-        // Update free-space directory — page now has more room.
+        // Update FSM — page now has more room.
         let info = self.table_files.get_mut(&key).unwrap();
-        let pidx = rid.page_id as usize;
-        if pidx < info.free_space.len() {
-            info.free_space[pidx] = actual_free as u16;
-        }
+        info.fsm.update(rid.page_id as usize, actual_free);
 
         Ok(deleted)
     }
 
-    /// Flush all dirty pages across all buffer pools.
+    /// Flush all dirty pages across all buffer pools and persist FSMs.
     pub fn flush_all(&mut self) -> Result<()> {
-        self.pool_manager.flush_all()
+        self.pool_manager.flush_all()?;
+        for info in self.table_files.values() {
+            info.fsm.save(&info.fsm_path)?;
+        }
+        Ok(())
     }
 
     /// Shared reference to the pool manager.
@@ -383,9 +363,8 @@ mod tests {
             TableFileInfo {
                 pool_id: 1,
                 file_id,
-                free_space: Vec::new(),
-                next_free_hint: 0,
-                page_size: PAGE_SIZE,
+                fsm: FreeSpaceMap::new(0, PAGE_SIZE),
+                fsm_path: dat_path.with_extension("FSM"),
             },
         );
 
@@ -485,9 +464,8 @@ mod tests {
                 TableFileInfo {
                     pool_id: 1,
                     file_id,
-                    free_space: Vec::new(),
-                    next_free_hint: 0,
-                    page_size: PAGE_SIZE,
+                    fsm: FreeSpaceMap::new(0, PAGE_SIZE),
+                    fsm_path: dat_path.with_extension("FSM"),
                 },
             );
             let mut tsm = TablespaceManager {
@@ -515,9 +493,9 @@ mod tests {
                 TableFileInfo {
                     pool_id: 1,
                     file_id,
-                    free_space: Vec::new(),
-                    next_free_hint: 0,
-                    page_size: PAGE_SIZE,
+                    fsm: FreeSpaceMap::load(&dat_path.with_extension("FSM")).unwrap()
+                        .unwrap_or_else(|| FreeSpaceMap::new(0, PAGE_SIZE)),
+                    fsm_path: dat_path.with_extension("FSM"),
                 },
             );
             let mut tsm = TablespaceManager {
