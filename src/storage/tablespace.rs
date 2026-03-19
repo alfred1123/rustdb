@@ -54,15 +54,8 @@ impl TablespaceManager {
         }
 
         // 3. Register each table's DAT file with its tablespace's buffer pool.
-        //    Skip RQSYS catalog tables — their .DAT files are flat binary
-        //    (not slotted pages) and are served by the CatalogCache instead.
-        //    After Phase 5 migrates catalog to page-based storage, this
-        //    guard can be removed.
         let mut table_files = HashMap::new();
         for table in &catalog.tables {
-            if table.schemaname == "RQSYS" {
-                continue;
-            }
             let ts = cache
                 .get_tablespace_by_id(table.tbspaceid as i32)
                 .ok_or_else(|| {
@@ -520,13 +513,13 @@ mod tests {
         let cfg = crate::catalog::config::DbConfig::default();
         crate::catalog::bootstrap::bootstrap(&dir.path, &cfg).unwrap();
         let catalog =
-            crate::catalog::loader::load_catalog(&dir.path, false).unwrap();
+            crate::catalog::loader::load_catalog(&dir.path, false, cfg.page_size).unwrap();
         let cache = crate::catalog::cache::CatalogCache::new(catalog);
 
         let tsm = TablespaceManager::open(&dir.path, &cache).unwrap();
 
-        // RQSYS catalog tables are skipped (flat binary, served by CatalogCache).
-        assert_eq!(tsm.table_files.len(), 0);
+        // All 5 RQSYS catalog tables are registered (page-based since Phase 5).
+        assert_eq!(tsm.table_files.len(), 5);
 
         // All 4 buffer pools should be created.
         let pool_ids = tsm.pool_manager.pool_ids();

@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     log::info!("config: PAGESIZE={}, DIAGLEVEL={}, TEXT_MODE={}",
         config.page_size, config.diag_level, config.text_mode);
 
-    let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode)?;
+    let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode, config.page_size)?;
     let cache = catalog::cache::CatalogCache::new(catalog);
     log::info!("catalog cache built");
 

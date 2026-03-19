@@ -67,6 +67,74 @@ Each slot is 4 bytes: `u16 offset` + `u16 length`.
 - On insert, deleted slots are scanned and **reused** before appending
   a new slot entry.
 
+### Row Insertion — Counter-Directional Growth
+
+The slot directory and row data grow toward each other from opposite ends of
+the page. This is a classic database technique (used by PostgreSQL, SQLite,
+DB2, etc.) that avoids fragmentation and maximizes usable free space.
+
+**Walkthrough:** Inserting 3 rows into an empty 4096-byte page:
+
+```
+Step 0: Empty page
+         byte 0                                         byte 4095
+         ┌──────────┬──────────────────────────────────────────┐
+         │ Header   │              free space                  │
+         │ (24 B)   │                                          │
+         └──────────┴──────────────────────────────────────────┘
+         free_space_ptr ─────────────────────────────────► 4096
+
+Step 1: INSERT row A (10 bytes)
+  1. data_start = free_space_ptr - 10 = 4086
+  2. copy row A into buf[4086..4096]
+  3. write slot 0 at byte 24: (offset=4086, length=10)
+  4. slot_count = 1
+
+         ┌──────────┬────────┬──────────────────┬──────────┐
+         │ Header   │ Slot 0 │    free space    │  Row A   │
+         │ (24 B)   │ (4 B)  │                  │ (10 B)   │
+         └──────────┴────────┴──────────────────┴──────────┘
+         byte 24    byte 28                 byte 4086  byte 4096
+                      │                         ▲
+                      └─ offset=4086, len=10 ───┘
+
+Step 2: INSERT row B (15 bytes)
+  1. data_start = 4086 - 15 = 4071
+  2. copy row B into buf[4071..4086]
+  3. write slot 1 at byte 28: (offset=4071, length=15)
+  4. slot_count = 2
+
+         ┌──────────┬────────┬────────┬──────┬──────────┬──────────┐
+         │ Header   │ Slot 0 │ Slot 1 │ free │  Row B   │  Row A   │
+         │ (24 B)   │ (4 B)  │ (4 B)  │      │ (15 B)   │ (10 B)   │
+         └──────────┴────────┴────────┴──────┴──────────┴──────────┘
+         byte 24    28       32           byte 4071  4086      4096
+
+Step 3: INSERT row C (8 bytes)
+  1. data_start = 4071 - 8 = 4063
+  2. copy row C into buf[4063..4071]
+  3. write slot 2 at byte 32: (offset=4063, length=8)
+  4. slot_count = 3
+
+         ┌──────────┬─────┬─────┬─────┬──────┬───────┬───────┬──────┐
+         │ Header   │ S0  │ S1  │ S2  │ free │ Row C │ Row B │Row A │
+         │ (24 B)   │(4B) │(4B) │(4B) │      │ (8B)  │(15B)  │(10B) │
+         └──────────┴─────┴─────┴─────┴──────┴───────┴───────┴──────┘
+                                 byte 36  4063   4071   4086   4096
+                                  │         ↕ shrinks ↕       │
+                                  └── directory grows →       │
+                                            ← row data grows ─┘
+```
+
+The page is full when the slot directory and row data would collide, i.e.
+when `data_start - dir_end < SLOT_SIZE (4 bytes) + row_len`.
+
+**Code:** See `insert_row_into()` in `page.rs`. The key line is:
+```rust
+let new_data_start = data_start - row.len();  // grows backward
+buf[new_data_start..new_data_start + row.len()].copy_from_slice(row);
+```
+
 ### CRC32 Checksum
 
 Integrity is verified via `crc32fast`. The checksum covers all page bytes
@@ -539,27 +607,33 @@ candidates.
 - `rows_spill_to_new_page` — 20 rows across multiple pages, all readable
 - `flush_persists_data` — insert, flush, reopen manager, data survives
 - `table_not_found` — unknown table returns error
-- `open_from_catalog` — integration: bootstrap → load catalog → open manager
+- `open_from_catalog` — integration: bootstrap → load catalog → open manager → all 5 RQSYS tables registered
 - `row_too_large_for_page` — oversized row returns error
 
-**Note:** Catalog tables (`RQSYS.*`) are skipped during `open()` — their
-flat binary `.DAT` files are never registered with the buffer pool. They
-are served exclusively by the `CatalogCache` via the catalog loader.
-Phase 5 will migrate them to page-based storage.
+### Phase 5 — Migrate Catalog to Page-Based Storage ✅
 
-### Phase 5 — Migrate Catalog to Page-Based Storage
+System catalog tables now use the same page-based `.DAT` format as user
+tables. They are no longer flat binary streams.
 
-Once phases 1–4 are solid, migrate the system catalog tables from the current
-flat row format to page-structured `.DAT` files. This means:
+**What changed:**
 
-- Bootstrap writes catalog rows into slotted pages instead of flat streams
-- Loader reads catalog via `TablespaceManager.table_scan()` instead of
-  `read_binary_rows()`
-- The catalog becomes truly self-describing: same storage path as user tables
+- **Bootstrap** writes catalog rows into slotted pages via `HeapFile` +
+  `insert_row()`. Each `.DAT` file gets a companion `.FSM` free-space map.
+- **Loader** reads catalog via `HeapFile::open()` + `scan()` instead of
+  the old flat `[u64_len][bytes]` streaming format.
+- **Tablespace manager** no longer skips `RQSYS` tables during `open()` —
+  all 5 catalog tables are registered with the buffer pool alongside user
+  tables.
+- The catalog is now truly self-describing: same storage path as user
+  tables.
 
 **Text mode:** Text mode (`--text-mode`) remains available for debugging.
 When `text_mode=true`, bypass the page layer and continue using flat TSV
 files. The page-based path is the `text_mode=false` default.
+
+**Breaking change:** Databases created before Phase 5 have flat binary
+`.DAT` files that are incompatible with the new page-based loader. Delete
+the old database directory and re-bootstrap to create page-based files.
 
 ### Phase 6 — Wire Up to SQL Executor
 
@@ -591,6 +665,45 @@ Catalog tables (`SYSTABLES`, `SYSCOLUMNS`, `SYSTABLESPACES`, `SYSSCHEMAS`,
 needs column metadata, the executor needs tablespace-to-file mappings, etc.
 Reading them from disk each time is wasteful. The strategy below keeps
 catalog data in memory for fast access while preserving correctness.
+
+### Why a Separate Cache (Not the Buffer Pool)
+
+Although catalog `.DAT` files now use the same slotted-page format as user
+tables (Phase 5), catalog data is served from a **dedicated in-memory cache**
+(`CatalogCache`), not from the buffer pool. This is a deliberate design
+choice:
+
+| Concern | Buffer Pool | Dedicated Cache |
+|---------|-------------|----------------|
+| Access pattern | Random page I/O, pin/unpin per page | Direct HashMap lookup, O(1) |
+| Eviction risk | LRU eviction under memory pressure | Never evicted — always resident |
+| Latch overhead | Shared/exclusive latch per access | No latching (single-session) |
+| Deserialization | Parse `RowReader` on every access | Pre-materialized `Vec<Value>` once |
+| Startup cost | Lazy (cache-miss on first access) | Eager (all tables loaded once) |
+
+Catalog metadata is tiny (~5 MB at 1,000 tables) and accessed on
+**every** query for planning and column resolution. Routing it through the
+buffer pool would add pin/unpin overhead, latch contention, and eviction
+risk — all for data that should never leave memory.
+
+The buffer pool is designed for large-volume user data where eviction and
+lazy loading are essential. Catalog metadata has the opposite profile:
+small, hot, and needed on every operation.
+
+**How it works together:** At startup, the catalog loader reads `.DAT` files
+directly via `HeapFile` (bypassing the buffer pool). The loaded structs are
+wrapped in `CatalogCache` with HashMap indexes. Then the `TablespaceManager`
+registers those same `.DAT` files with the buffer pool for DML operations.
+So catalog files have two access paths:
+
+```
+Startup:   HeapFile::scan() → loader → CatalogCache (metadata lookups)
+DML path:  TablespaceManager → BufferPool → HeapFile (INSERT/UPDATE/DELETE)
+```
+
+This dual-path is similar to PostgreSQL's `syscache` (separate from the
+buffer pool's `shared_buffers`) and DB2's catalog cache (separate from
+`SYSCATSPACE` buffer pool pages).
 
 ### Design
 

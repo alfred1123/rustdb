@@ -15,9 +15,9 @@ System catalog module — manages the database's internal metadata.
 
 ## How It Works
 
-1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the five system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`, `SYSBUFFERPOOLS`) into `systbsp/` as `.DAT` files.
+1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the five system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`, `SYSBUFFERPOOLS`) into `systbsp/` as `.DAT` files. In binary mode (default), each `.DAT` file is a **slotted-page heap file** written via `HeapFile`, with a companion `.FSM` free-space map. In text mode, files are flat TSV.
 2. **Config** (`config.rs`) reads `SQLDBCONF` on subsequent startups so the engine knows the database's settings.
-3. **Loader** (`loader.rs`) reads those `.DAT` files back, splitting them into rows and deserializing each row with `RowReader`.
+3. **Loader** (`loader.rs`) reads those `.DAT` files back. In binary mode, it opens each file as a `HeapFile` and calls `scan()` to extract rows from slotted pages. Each row is then deserialized with `RowReader`. In text mode, it parses TSV lines.
 4. **Cache** (`cache.rs`) wraps the loaded `Catalog` in a `CatalogCache` that stays resident for the lifetime of the database.  It pre-materializes all catalog rows as `Vec<Value>` and builds `HashMap` indexes for O(1) lookup by name or ID.  The SQL executor reads exclusively from this cache — no per-query struct conversion or linear scans.
 5. The row format is simple: each field is `[u64 LE length][value bytes]`. Types like `SMALLINT` and `INTEGER` are stored as little-endian fixed-width integers; strings are raw UTF-8 bytes; booleans are `Y`/`N` flag bytes.
 

@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::catalog::config::DbConfig;
 use crate::catalog::row::RowWriter;
 use crate::error::Result;
+use crate::storage::heap::HeapFile;
 
 const SCHEMA: &str = "RQSYS";
 
@@ -17,17 +18,18 @@ pub fn bootstrap(data_dir: &Path, config: &DbConfig) -> Result<()> {
     config.write(data_dir)?;
 
     let systbsp = data_dir.join("systbsp");
-    write_systablespaces(&systbsp, config.page_size, config.text_mode)?;
-    write_sysschemas(&systbsp, config.text_mode)?;
-    write_systables(&systbsp, config.text_mode)?;
-    write_syscolumns(&systbsp, config.text_mode)?;
-    write_sysbufferpools(&systbsp, config.page_size, config.text_mode)?;
+    let ps = config.page_size;
+    write_systablespaces(&systbsp, ps, config.text_mode)?;
+    write_sysschemas(&systbsp, ps, config.text_mode)?;
+    write_systables(&systbsp, ps, config.text_mode)?;
+    write_syscolumns(&systbsp, ps, config.text_mode)?;
+    write_sysbufferpools(&systbsp, ps, config.text_mode)?;
 
     log::info!("bootstrap complete: SQLDBCONF + 5 catalog tables written");
     Ok(())
 }
 
-fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary_rows: &[Vec<u8>], text_mode: bool) -> Result<()> {
+fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary_rows: &[Vec<u8>], text_mode: bool, page_size: usize) -> Result<()> {
     let path = dir.join(format!("{SCHEMA}.{table}.0.DAT"));
     if text_mode {
         let mut content = String::from(header);
@@ -38,12 +40,11 @@ fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary
         }
         fs::write(path, content)?;
     } else {
-        let mut buf = Vec::new();
+        let mut heap = HeapFile::open(&path, page_size)?;
         for row in binary_rows {
-            buf.extend_from_slice(&(row.len() as u64).to_le_bytes());
-            buf.extend_from_slice(row);
+            heap.insert_row(row)?;
         }
-        fs::write(path, buf)?;
+        heap.save_fsm()?;
     }
     Ok(())
 }
@@ -75,16 +76,16 @@ fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result
         })
         .collect();
 
-    write_dat(dir, "SYSTABLESPACES", "TBSPACEID\tTBSPACE\tTBSPACETYPE\tDATATYPE\tPAGESIZE\tSTATE\tBUFFERPOOLID", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSTABLESPACES", "TBSPACEID\tTBSPACE\tTBSPACETYPE\tDATATYPE\tPAGESIZE\tSTATE\tBUFFERPOOLID", &text_rows, &binary_rows, text_mode, page_size)
 }
 
-fn write_sysschemas(dir: &Path, text_mode: bool) -> Result<()> {
+fn write_sysschemas(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let mut w = RowWriter::new();
     w.write_string(SCHEMA);
-    write_dat(dir, "SYSSCHEMAS", "NAME", &[SCHEMA.to_string()], &[w.finish()], text_mode)
+    write_dat(dir, "SYSSCHEMAS", "NAME", &[SCHEMA.to_string()], &[w.finish()], text_mode, page_size)
 }
 
-fn write_systables(dir: &Path, text_mode: bool) -> Result<()> {
+fn write_systables(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let tables: [(&str, i16); 5] = [
         ("SYSTABLESPACES", 7i16),
         ("SYSSCHEMAS", 1),
@@ -108,10 +109,10 @@ fn write_systables(dir: &Path, text_mode: bool) -> Result<()> {
         })
         .collect();
 
-    write_dat(dir, "SYSTABLES", "NAME\tSCHEMANAME\tTBSPACEID\tCOLCOUNT", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSTABLES", "NAME\tSCHEMANAME\tTBSPACEID\tCOLCOUNT", &text_rows, &binary_rows, text_mode, page_size)
 }
 
-fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
+fn write_syscolumns(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let cols: &[(&str, &str, i16, &str, bool)] = &[
         ("TBSPACEID", "SYSTABLESPACES", 0, "INTEGER", false),
         ("TBSPACE", "SYSTABLESPACES", 1, "VARCHAR(128)", false),
@@ -157,7 +158,7 @@ fn write_syscolumns(dir: &Path, text_mode: bool) -> Result<()> {
         })
         .collect();
 
-    write_dat(dir, "SYSCOLUMNS", "NAME\tTABNAME\tSCHEMANAME\tORDINAL\tTYPENAME\tNULLABLE", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSCOLUMNS", "NAME\tTABNAME\tSCHEMANAME\tORDINAL\tTYPENAME\tNULLABLE", &text_rows, &binary_rows, text_mode, page_size)
 }
 
 fn write_sysbufferpools(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
@@ -185,5 +186,5 @@ fn write_sysbufferpools(dir: &Path, page_size: usize, text_mode: bool) -> Result
         })
         .collect();
 
-    write_dat(dir, "SYSBUFFERPOOLS", "BPID\tBPNAME\tPAGESIZE\tNPAGES", &text_rows, &binary_rows, text_mode)
+    write_dat(dir, "SYSBUFFERPOOLS", "BPID\tBPNAME\tPAGESIZE\tNPAGES", &text_rows, &binary_rows, text_mode, page_size)
 }
