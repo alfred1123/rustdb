@@ -207,6 +207,22 @@ comfortably in memory.
 - DDL acquires a write lock to mutate entries (rare operation).
 - No eviction machinery needed — all threads share the full resident cache.
 
+**TODO — Zone Maps (SYSCOLUMNS extension):**
+
+Add per-column zone-map metadata to `SYSCOLUMNS` so the executor can skip pages
+that cannot satisfy a WHERE predicate without fetching them into the buffer pool.
+
+New columns:
+- `ZONEMAP` (`CHAR(1)`) — `Y`/`N` flag: is a zone map maintained for this column?
+
+The actual per-page min/max values live in `TableFileInfo.zone_maps` in the
+tablespace manager (in-memory `Vec<PageZoneMap>`), not in the catalog. The
+catalog column just controls which columns have zone maps enabled.
+
+On insert/update, the tablespace manager updates the page's min/max for each
+zone-mapped column. On scan with a range predicate (`>`, `<`, `BETWEEN`),
+the executor checks the zone map to skip pages whose range doesn't overlap.
+
 **When to revisit the full-preload decision:**
 
 - **100K+ tables** where memory cost is no longer negligible → add LRU eviction.

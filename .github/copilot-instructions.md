@@ -20,13 +20,14 @@ rustdb/
 │   ├── sql/                  # SQL parser, planner, executor
 │   ├── transaction/          # WAL, MVCC / lock-based concurrency, ARIES recovery
 │   └── server/               # TCP listener, wire protocol, session management
-├── TESTDB/                   # Default database instance directory
-│   ├── admin/                # Database configuration
-│   ├── backups/              # Database backups
-│   ├── log/                  # Write-ahead log (WAL) files
-│   ├── systbsp/              # System tablespace — catalog data files
-│   ├── temptbsp/             # Temporary tablespace
-│   └── usertbsp/             # User tablespace — user table data files
+├── data/
+│   └── TESTDB/                # Default database instance directory
+│       ├── admin/                # Database configuration
+│       ├── backups/              # Database backups
+│       ├── log/                  # Write-ahead log (WAL) files
+│       ├── systbsp/              # System tablespace — catalog data files
+│       ├── temptbsp/             # Temporary tablespace
+│       └── usertbsp/             # User tablespace — user table data files
 ├── Cargo.toml
 └── README.md
 ```
@@ -47,6 +48,7 @@ Example: `RQSYS.SYSTABLES.0.DAT`
 | RQSYS.SYSTABLES        | Table metadata (name, schemaname, tbspaceid, colcount) |
 | RQSYS.SYSCOLUMNS       | Column definitions (name, tabname, schemaname, ordinal, typename, nullable) |
 | RQSYS.SYSSCHEMAS       | Schema definitions                  |
+| RQSYS.SYSBUFFERPOOLS   | Buffer pool definitions (bpid, bpname, pagesize, npages) |
 
 All catalog data is stored in a custom binary row format with length-prefixed fields.
 
@@ -133,3 +135,9 @@ cargo run -- --data-dir ./TESTDB
   have their own `README.md`. When you add or change behavior in a module, update that
   module's README — not the root README — with data representations, new flags, format
   changes, or usage notes. The root `README.md` covers project-level overview and quick start only.
+- **Review READMEs after every code change.**
+  After completing any implementation work, review all READMEs that could be affected
+  and fix any content that has become outdated. Stale documentation is worse than no
+  documentation — it misleads. Check for: removed features still described, renamed
+  fields/methods, changed behavior (e.g., skip logic, new optimizations), and notes
+  that reference old code paths.

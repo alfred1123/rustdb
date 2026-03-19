@@ -4,11 +4,12 @@ Page-based storage engine.
 
 ## Files
 
-| File      | Purpose                                         |
-|-----------|-------------------------------------------------|
-| `page.rs` | Slotted page: 24-byte header, slot directory, row data, CRC32 checksums |
-| `heap.rs` | Heap file: manages a `.DAT` file as a sequence of slotted pages, RID addressing |
-| `pool.rs` | Buffer pool: fixed-size frame pool, LRU eviction, dirty-page tracking, pin counts |
+| File             | Purpose                                         |
+|------------------|-------------------------------------------------|
+| `page.rs`        | Slotted page: 24-byte header, slot directory, row data, CRC32 checksums |
+| `heap.rs`        | Heap file: manages a `.DAT` file as a sequence of slotted pages, RID addressing |
+| `pool.rs`        | Buffer pool: fixed-size frame pool, LRU eviction, dirty-page tracking, pin counts |
+| `tablespace.rs`  | Tablespace manager: maps (schema, table) to heap files, routes I/O through buffer pool |
 
 ---
 
@@ -167,9 +168,18 @@ inserts don't re-scan from page 0 every time.
 2. Skip pages where `free_space[pid] < row.len()` — **no disk read**.
 3. Read candidate page, attempt `page.insert_row(row)`.
 4. If it fits → write page back, update `next_free_hint`, return RID.
-5. If not → correct `free_space[pid]` to actual value, try next.
-6. If no existing page has space → create new page, insert, append to file.
+5. If not → correct `free_space[pid]` to actual value, track best-seen
+   free space. If this page has more free space than any previously seen,
+   record it as the best candidate.
+6. If no existing page has space → set `next_free_hint` to the page with
+   the most free space seen during the scan, then create a new page,
+   insert, and append to file.
 7. If row exceeds a single page's capacity → return error.
+
+The **best-seen hint** ensures `next_free_hint` always points to the page
+with the most free space observed during the scan — not just the last
+inserted page. This improves space reuse in fragmented tables at zero cost
+(one integer comparison per page touched).
 
 ### Tests (8)
 
@@ -415,6 +425,15 @@ catalog rows, then routes all file registrations to the correct pool.
 | `flush_all` | `(&mut self) -> Result<()>` | Flush every dirty page in every pool |
 | `pool_ids` | `(&self) -> Vec<(BufferPoolId, &str)>` | List (id, name) pairs sorted by id |
 
+### Logical Page Count
+
+Each registered file tracks a **logical page count** that includes pages
+allocated via `new_page` but not yet flushed to disk. This ensures
+consecutive `new_page` calls generate unique page IDs even before flush.
+
+`BufferPool::file_page_count(file_id) -> Result<u64>` exposes this count
+to the tablespace manager for scan and insert operations.
+
 ### BufferPoolManager Tests (4)
 
 - `manager_create_multiple_pools` — creates 3 pools, validates name/capacity/page_size
@@ -422,23 +441,94 @@ catalog rows, then routes all file registrations to the correct pool.
 - `manager_register_file_routes_to_pool` — files registered to different pools
 - `manager_flush_all_pools` — flush_all succeeds across empty pools
 
-### Phase 4 — Tablespace Manager (`tablespace.rs`)
+### Phase 4 — Tablespace Manager (`tablespace.rs`) ✅
 
-Central coordinator that maps tablespace IDs + table names to heap files and
-routes I/O through the buffer pool.
+Central coordinator that maps (schema, table) to heap files and routes all
+I/O through the buffer pool. Components above the tablespace manager never
+touch heap files or disk directly.
 
-**Responsibilities:**
-- On startup, open heap files for all tables listed in `SYSTABLES`
-- Resolve `(schema, table_name)` → `HeapFile` using catalog metadata
-- Provide a `table_scan(schema, table)` that returns an iterator of raw row
-  bytes (via buffer pool → heap file → slotted pages)
-- Provide `insert_row(schema, table, row_bytes) -> RID`
-- Provide `delete_row(schema, table, rid)`
+### Architecture
 
-**Deliverables:**
-- `TablespaceManager` struct owning `BufferPool` + map of open `HeapFile`s
-- Methods listed above
-- Integration test: create table file, insert rows, scan back
+```
+SQL Executor / Catalog
+        │
+        ▼
+  TablespaceManager
+        │  resolve(schema, table) → (pool_id, file_id)
+        ▼
+  BufferPoolManager
+        │  fetch_page / fetch_page_mut / new_page / unpin
+        ▼
+  BufferPool → HeapFile → Disk
+```
+
+### Startup Flow (`open`)
+
+1. Create buffer pools from `SYSBUFFERPOOLS` catalog entries.
+2. Map tablespace IDs to directories (`SYSTBSP` → `systbsp/`, etc.).
+3. For each table in `SYSTABLES`, resolve its tablespace, build the
+   `SCHEMA.TABLE.0.DAT` path, register the heap file with the correct pool.
+4. Store `(schema, table) → (pool_id, file_id)` routing table.
+
+### Public API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `open` | `(data_dir, &CatalogCache) -> Result<Self>` | Build from catalog: create pools, register files |
+| `table_scan` | `(&mut self, schema, table) -> Result<Vec<(Rid, Vec<u8>)>>` | All live rows via buffer pool |
+| `insert_row` | `(&mut self, schema, table, &[u8]) -> Result<Rid>` | Insert row, return RID |
+| `read_row` | `(&mut self, schema, table, Rid) -> Result<Vec<u8>>` | Read one row by RID |
+| `delete_row` | `(&mut self, schema, table, Rid) -> Result<bool>` | Tombstone a row |
+| `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages in all pools |
+| `pool_manager` | `(&self) -> &BufferPoolManager` | Read-only access for diagnostics |
+
+### Insert Flow (Free-Space Directory)
+
+Each `TableFileInfo` maintains a per-page free-space directory (`Vec<u16>`)
+and a `next_free_hint` pointing to the first page likely to have space.
+
+1. Resolve `(schema, table)` → `TableFileInfo` (pool_id, file_id, free-space dir).
+2. Scan from `next_free_hint`, wrapping around. For each page, check
+   `free_space[pidx]` against the row size — **no latch required**.
+3. Skip pages where the directory says there isn't enough space.
+4. On a candidate page: `fetch_page_mut` (exclusive latch), attempt insert.
+   - Success: unpin dirty, update directory entry, advance hint, return RID.
+   - Failure (concurrent fill): update directory entry, unpin clean, continue.
+5. If no existing page fits: `new_page`, insert, extend directory.
+6. If row exceeds page capacity: return error.
+
+The directory eliminates the old shared-read probe and its latch gap
+(shared-check → unpin → exclusive-write where another thread could fill
+the page). Pages are skipped entirely via the in-memory directory.
+
+During the scan, each page touched updates a **best-seen** tracker. If no
+existing page fits, `next_free_hint` is set to the page with the most free
+space observed — so the next insert starts at the best candidate rather
+than the last page checked. This improves space reuse in fragmented tables
+at zero cost (one integer comparison per page touched).
+
+### Scan Flow
+
+1. Resolve `(schema, table)` → `(pool_id, file_id)`.
+2. Get `file_page_count` from the buffer pool (includes unflushed pages).
+3. For each page: `fetch_page`, iterate slots, collect live rows, `unpin`.
+
+### Tests (9)
+
+- `scan_empty_table` — scan returns empty on a fresh file
+- `insert_and_read` — insert one row, read it back by RID
+- `insert_and_scan` — insert 3 rows, scan returns all in order
+- `delete_row_removes_from_scan` — deleted row absent from scan
+- `rows_spill_to_new_page` — 20 rows across multiple pages, all readable
+- `flush_persists_data` — insert, flush, reopen manager, data survives
+- `table_not_found` — unknown table returns error
+- `open_from_catalog` — integration: bootstrap → load catalog → open manager
+- `row_too_large_for_page` — oversized row returns error
+
+**Note:** Catalog tables (`RQSYS.*`) are skipped during `open()` — their
+flat binary `.DAT` files are never registered with the buffer pool. They
+are served exclusively by the `CatalogCache` via the catalog loader.
+Phase 5 will migrate them to page-based storage.
 
 ### Phase 5 — Migrate Catalog to Page-Based Storage
 

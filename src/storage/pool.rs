@@ -67,6 +67,9 @@ struct FileEntry {
     #[allow(dead_code)]
     path: PathBuf,
     heap: HeapFile,
+    /// Logical page count — includes pages allocated via `new_page`
+    /// that may not have been flushed to disk yet.
+    page_count: u64,
 }
 
 /// A fixed-size, pre-allocated buffer pool that mediates all page I/O.
@@ -129,6 +132,7 @@ impl BufferPool {
             )));
         }
         let heap = HeapFile::open(path, page_size)?;
+        let page_count = heap.page_count();
         let fid = self.next_file_id;
         self.next_file_id += 1;
         self.files.insert(
@@ -136,6 +140,7 @@ impl BufferPool {
             FileEntry {
                 path: path.to_path_buf(),
                 heap,
+                page_count,
             },
         );
         Ok(fid)
@@ -188,9 +193,13 @@ impl BufferPool {
     /// Allocate a brand-new page in the given file. The page is initialized
     /// in the pre-allocated frame, already pinned and marked dirty.
     pub fn new_page(&mut self, file_id: FileId) -> Result<(PageId, PageMut<'_>)> {
-        let new_pid = self.files.get(&file_id)
-            .ok_or_else(|| Error::Catalog(format!("file_id {file_id} not registered")))?
-            .heap.page_count();
+        let new_pid = {
+            let entry = self.files.get_mut(&file_id)
+                .ok_or_else(|| Error::Catalog(format!("file_id {file_id} not registered")))?;
+            let pid = entry.page_count;
+            entry.page_count += 1;
+            pid
+        };
         let page_size = self.page_size;
 
         let frame_idx = self.evict_for_frame()?;
@@ -274,6 +283,17 @@ impl BufferPool {
     /// Returns the pool name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the logical page count for a registered file.
+    ///
+    /// This includes pages allocated via `new_page` that may not have been
+    /// flushed to disk yet.
+    pub fn file_page_count(&self, file_id: FileId) -> Result<u64> {
+        self.files
+            .get(&file_id)
+            .map(|e| e.page_count)
+            .ok_or_else(|| Error::Catalog(format!("file_id {file_id} not registered")))
     }
 
     // ── Internal helpers ──

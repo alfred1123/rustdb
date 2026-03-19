@@ -147,6 +147,11 @@ impl HeapFile {
     pub fn insert_row(&mut self, row: &[u8]) -> Result<Rid> {
         let needed = row.len();
 
+        // Track the page with the most free space seen during the scan
+        // so the hint points to the best candidate for the next insert.
+        let mut best_free: usize = 0;
+        let mut best_page: usize = self.next_free_hint;
+
         // Scan from the hint forward, then wrap around.
         let count = self.page_count as usize;
         for i in 0..count {
@@ -166,8 +171,16 @@ impl HeapFile {
                 });
             }
             // Page didn't have enough room after all — correct its free space.
-            self.free_space[pid as usize] = page.free_space() as u16;
+            let actual = page.free_space();
+            self.free_space[pid as usize] = actual as u16;
+            if actual > best_free {
+                best_free = actual;
+                best_page = pid as usize;
+            }
         }
+
+        // Update hint to the best page seen before allocating new.
+        self.next_free_hint = best_page;
 
         // No existing page has space — append a new one.
         let new_pid = self.page_count;
