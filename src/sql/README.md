@@ -29,6 +29,14 @@ SQL parser, planner, and executor.
 - ORDER BY, GROUP BY, HAVING
 - JOINs
 
+## TODO — Multi-threaded Executor
+
+The executor currently takes `&CatalogCache` (single-threaded borrow). When
+multi-session is added, change to `Arc<RwLock<CatalogCache>>` and acquire a
+shared read lock for the duration of query execution. DDL statements will
+need a write lock to mutate the cache. No cache eviction is needed at our
+target scale (≤10K tables).
+
 ## SQLSTATE Error Codes
 
 Errors follow the ANSI SQL SQLSTATE convention (5-character codes):

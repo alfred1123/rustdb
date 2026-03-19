@@ -525,8 +525,17 @@ catalog data in memory for fast access while preserving correctness.
 | Buffer pool eviction | No cache impact — cache is separate from page frames |
 
 Because RustDB is currently single-session, there is no cross-session
-invalidation concern. When multi-session support is added, the cache
-will need a latch or read-copy-update (RCU) scheme.
+invalidation concern.
+
+**No eviction required.** The cache holds only catalog metadata (never user
+data), so its size is bounded by DDL, not workload. At the target scale
+(up to 10K tables, ~12 columns each) the cache is ~50 MB — trivially small.
+Eviction would add LRU tracking overhead and contention with no benefit.
+
+**TODO — Multi-threaded access:**
+Wrap in `Arc<RwLock<CatalogCache>>`. Query threads take shared read locks
+(concurrent readers, zero contention). DDL takes a write lock (rare).
+No eviction or shared-memory invalidation needed at this scale.
 
 ### Dependency
 
@@ -607,13 +616,13 @@ single-session, low-concurrency stage. The `VecDeque` implementation is easy
 to reason about and test. Upgrading to CLOCK is the natural first step when
 profiling shows `retain()` overhead or scan pollution becomes measurable.
 
-### Free-Space Tracking: In-Memory `Vec<bool>` vs On-Disk Bitmaps
+### Free-Space Tracking: In-Memory `Vec<u16>` vs On-Disk Bitmaps
 
 | | Current | Alternative (Oracle ASSM-style) |
 |---|---|---|
-| **Design** | In-memory boolean per page + planned current-page hint | On-disk bitmap blocks with graduated fullness levels (0–25%, 25–50%, etc.) |
-| **Pro** | Trivial to implement and understand | Survives crash; scales to millions of pages; low insert contention |
-| **Con** | Lost on crash (rebuilt optimistically); linear O(n) scan | Bitmap blocks consume space; L1/L2/L3 tree adds implementation cost |
+| **Design** | In-memory `Vec<u16>` tracking actual free bytes per page + `next_free_hint` | On-disk bitmap blocks with graduated fullness levels (0–25%, 25–50%, etc.) |
+| **Pro** | Skips too-full pages without disk reads; near-O(1) inserts via hint | Survives crash; scales to millions of pages; low insert contention |
+| **Con** | Lost on crash (rebuilt optimistically on reopen) | Bitmap blocks consume space; L1/L2/L3 tree adds implementation cost |
 
 **Potential upgrade (incremental):**
 1. **Near-term:** Persist the free map as a header page (page 0) in each
@@ -665,7 +674,7 @@ read consistency without abandoning the single-log model.
 | Area | Current approach | Complexity | Performance ceiling |
 |------|-----------------|------------|-------------------|
 | Buffer pools | Named, per-tablespace | Low | Medium (manual tuning) |
-| Free-space map | In-memory `Vec<bool>` | Trivial | Low (linear scan, lost on crash) |
+| Free-space map | In-memory `Vec<u16>` + hint | Low | Medium (skips full pages without I/O, lost on crash) |
 | Deletes | Tombstone | Low | Medium (needs compaction) |
 | Row addressing | `RID(page, slot)` | Low | Sufficient for single-file tables |
 | Recovery | ARIES WAL | Medium | High (proven at scale) |

@@ -157,6 +157,63 @@ Each catalog table is pre-materialized into a `CachedTable`:
 | Row materialization | O(rows) per query (clone + convert structs) | O(1) — pre-built |
 | `load_table_data()` | 90-line match with 5 hardcoded arms | 4-line cache lookup |
 
+### Design Rationale — Industry Comparison
+
+RustDB uses **full pre-load** (SQLite-style): all catalog tables are loaded into
+memory at startup and kept permanently resident. Production systems like
+PostgreSQL, DB2, and Oracle use **on-demand caching** with LRU eviction instead.
+
+| Aspect | RustDB | PostgreSQL (syscache) | DB2 (catalog cache) | Oracle (row cache) |
+|--------|--------|----------------------|---------------------|--------------------|
+| Loading | All tables at startup | On-demand per-entry | On-demand | On-demand |
+| Eviction | Never | Invalidation messages | LRU (`CATALOGCACHE_SZ`) | LRU in Shared Pool |
+| Storage path | Separate from buffer pool | Through buffer pool | Through buffer pool (SYSCATSPACE) | Through buffer cache |
+| Granularity | Entire tables | Individual tuples | Parsed descriptors | Individual rows |
+| Invalidation | None | `sinval` shared-memory messages | Automatic on DDL commit | DDL triggers flush |
+| Concurrency | Single-threaded | Per-entry pins + refcounts | Latch-protected | Latches + pins |
+
+**Why full pre-load is the right choice here:**
+
+- **Catalog is small relative to data.** Even 1,000 tables × 10 columns ≈ 3 MB.
+  This is trivial compared to the GB-scale data the buffer pool manages.
+- **Zero latency** — no cache-miss path, no miss-fill storms after restarts.
+- **Simpler code** — no eviction, reference counting, or miss-fill logic.
+- **Deterministic memory** — exact catalog memory usage is known at startup.
+
+The on-demand approach in PostgreSQL/DB2 exists because of constraints we do not
+have yet: schemas with hundreds of thousands of tables, shared memory across
+multiple backend processes, and concurrent DDL requiring fine-grained invalidation.
+
+**Why no eviction — even at scale:**
+
+Target scale is up to 10K tables (typical: ~1,000 tables, ~12 columns each).
+At that scale the entire catalog cache is roughly ~5 MB — trivially small.
+Since this cache holds only catalog metadata (never user data), it cannot grow
+unboundedly: the size is dictated by DDL, not by workload. Eviction would
+add LRU tracking overhead to every lookup and create contention under
+multi-threaded access — cost with no benefit when the entire working set fits
+comfortably in memory.
+
+| Scale | SYSTABLES | SYSCOLUMNS | HashMap overhead | Total |
+|-------|-----------|------------|------------------|-------|
+| 100 tables × 12 cols | 20 KB | 360 KB | 100 KB | ~500 KB |
+| 1,000 tables × 12 cols | 200 KB | 3.6 MB | 1 MB | ~5 MB |
+| 10,000 tables × 12 cols | 2 MB | 36 MB | 10 MB | ~50 MB |
+
+**TODO — Multi-threaded access:**
+
+- Wrap cache in `Arc<RwLock<CatalogCache>>` for concurrent read access.
+- Query threads take read locks (zero contention — `RwLock` allows concurrent readers).
+- DDL acquires a write lock to mutate entries (rare operation).
+- No eviction machinery needed — all threads share the full resident cache.
+
+**When to revisit the full-preload decision:**
+
+- **100K+ tables** where memory cost is no longer negligible → add LRU eviction.
+- **Concurrent DDL** (`CREATE TABLE`, `ALTER TABLE`) → add entry-level cache mutation.
+- **Phase 5** (migrate catalog to slotted pages) will naturally move catalog data
+  into the buffer pool, aligning with DB2/PostgreSQL architecture.
+
 ### Tests (6)
 
 - `lookup_table_by_name` — O(1) table metadata access
