@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::storage::page::{
     PageId, PageRead, PageWrite, SlotIndex, SlottedPage,
-    free_space_of, page_id_of,
+    PAGE_HEADER_SIZE, free_space_of, page_id_of,
 };
 
 /// Physical row address: (page number, slot index within that page).
@@ -23,8 +23,13 @@ pub struct HeapFile {
     page_size: usize,
     /// Total number of pages currently in the file.
     page_count: u64,
-    /// Simple free-space directory: `true` if a page may have room for inserts.
-    free_map: Vec<bool>,
+    /// Per-page free-space directory: tracks usable bytes available in each page.
+    /// Inserts compare `free_space[pid] >= row.len()` to skip pages that
+    /// definitely cannot hold the row — no disk read required.
+    free_space: Vec<u16>,
+    /// Hint: index of the first page likely to have free space.
+    /// Avoids re-scanning from page 0 on every insert.
+    next_free_hint: usize,
 }
 
 impl HeapFile {
@@ -44,14 +49,17 @@ impl HeapFile {
             0
         };
 
-        // Assume all existing pages might have free space; inserts will update.
-        let free_map = vec![true; page_count as usize];
+        // Optimistic: assume existing pages have maximum usable space.
+        // The first real insert will read the page and correct the value.
+        let max_usable = if page_size > PAGE_HEADER_SIZE { page_size - PAGE_HEADER_SIZE } else { 0 };
+        let free_space = vec![max_usable as u16; page_count as usize];
 
         Ok(Self {
             file,
             page_size,
             page_count,
-            free_map,
+            free_space,
+            next_free_hint: 0,
         })
     }
 
@@ -89,10 +97,10 @@ impl HeapFile {
         // Update page_count if this extends the file.
         if page_id >= self.page_count {
             self.page_count = page_id + 1;
-            self.free_map.resize(self.page_count as usize, true);
+            self.free_space.resize(self.page_count as usize, 0);
         }
-        // Update free map.
-        self.free_map[page_id as usize] = page.free_space() > 0;
+        // Record actual free space.
+        self.free_space[page_id as usize] = page.free_space() as u16;
         Ok(())
     }
 
@@ -125,31 +133,40 @@ impl HeapFile {
 
         if page_id >= self.page_count {
             self.page_count = page_id + 1;
-            self.free_map.resize(self.page_count as usize, true);
+            self.free_space.resize(self.page_count as usize, 0);
         }
-        self.free_map[page_id as usize] = free_space_of(buf) > 0;
+        self.free_space[page_id as usize] = free_space_of(buf) as u16;
         Ok(())
     }
 
     /// Insert a row into the heap, returning its RID.
     ///
-    /// Scans for a page with enough free space. If none found, appends a new page.
+    /// Uses the free-space directory to skip pages that cannot hold the row
+    /// (no disk read needed). Starts from `next_free_hint` to avoid
+    /// re-scanning known-full pages.
     pub fn insert_row(&mut self, row: &[u8]) -> Result<Rid> {
-        // Try existing pages that are marked as having free space.
-        for pid in 0..self.page_count {
-            if !self.free_map[pid as usize] {
+        let needed = row.len();
+
+        // Scan from the hint forward, then wrap around.
+        let count = self.page_count as usize;
+        for i in 0..count {
+            let pid = ((self.next_free_hint + i) % count) as u64;
+            // Skip pages that definitely cannot hold this row.
+            if (self.free_space[pid as usize] as usize) < needed {
                 continue;
             }
             let mut page = self.read_page(pid)?;
             if let Some(slot) = page.insert_row(row) {
                 self.write_page(&page)?;
+                // Advance hint to this page (it may still have room).
+                self.next_free_hint = pid as usize;
                 return Ok(Rid {
                     page_id: pid,
                     slot,
                 });
             }
-            // Page didn't have enough room after all.
-            self.free_map[pid as usize] = false;
+            // Page didn't have enough room after all — correct its free space.
+            self.free_space[pid as usize] = page.free_space() as u16;
         }
 
         // No existing page has space — append a new one.
@@ -159,6 +176,7 @@ impl HeapFile {
             .insert_row(row)
             .ok_or_else(|| Error::Catalog("row too large for a single page".into()))?;
         self.write_page(&page)?;
+        self.next_free_hint = new_pid as usize;
         Ok(Rid {
             page_id: new_pid,
             slot,

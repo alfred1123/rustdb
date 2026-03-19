@@ -127,19 +127,23 @@ physical address used by the buffer pool and future index layer.
 Page N lives at file offset `N * page_size`. Pages are read/written
 individually via seeking.
 
-### Free-Space Map
+### Free-Space Directory
 
-An in-memory `Vec<bool>` tracks which pages may have room for inserts:
+An in-memory `Vec<u16>` tracks the **actual free bytes** available in each page:
 
 | Event | Effect |
 |-------|--------|
-| File opened | All existing pages marked `true` (optimistic) |
-| After `write_page` | Updated based on `page.free_space() > 0` |
-| Insert fails on a page | Marked `false` (full) |
-| Row deleted from a page | Marked `true` (space freed) |
+| File opened | All existing pages set to `page_size - HEADER_SIZE` (optimistic) |
+| After `write_page` / `write_page_buf` | Updated to `page.free_space()` (exact value) |
+| Insert fails on a page | Corrected to actual `page.free_space()` |
 
-On insert, pages marked `false` are skipped. This avoids reading every page
-from disk to check for space. (Can be upgraded to an on-disk bitmap later.)
+On insert, pages where `free_space[pid] < row.len()` are skipped **without
+reading from disk**. This is a key improvement over the previous `Vec<bool>`
+approach which could only say "might have space" and required a disk read to
+find out.
+
+A `next_free_hint: usize` tracks the first page likely to have space, so
+inserts don't re-scan from page 0 every time.
 
 ### Public API
 
@@ -159,21 +163,13 @@ from disk to check for space. (Can be upgraded to an on-disk bitmap later.)
 
 ### Insert Flow
 
-1. Scan `free_map` for a page marked `true`.
-2. Read that page, attempt `page.insert_row(row)`.
-3. If it fits → write page back, return RID.
-4. If not → mark page `false`, try next.
-5. If no existing page has space → create new page, insert, append to file.
-6. If row exceeds a single page's capacity → return error.
-
-**Planned — Current-page hint:**
-The current linear scan of `free_map` reads pages one-by-one until it finds
-space. A better approach is to cache the **last-insert page ID** per heap file
-so the next insert jumps directly to the page most likely to have room. This
-hint would be maintained by `HeapFile` (or by the tablespace manager) and
-reset when the page fills. For catalog tables that are append-heavy at
-bootstrap, this avoids re-scanning from page 0 on every row. See the
-*Catalog Cache Strategy* section below for the broader caching plan.
+1. Start from `next_free_hint`, wrap around through all pages.
+2. Skip pages where `free_space[pid] < row.len()` — **no disk read**.
+3. Read candidate page, attempt `page.insert_row(row)`.
+4. If it fits → write page back, update `next_free_hint`, return RID.
+5. If not → correct `free_space[pid]` to actual value, try next.
+6. If no existing page has space → create new page, insert, append to file.
+7. If row exceeds a single page's capacity → return error.
 
 ### Tests (8)
 

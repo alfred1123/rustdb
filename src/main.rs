@@ -36,16 +36,18 @@ fn main() -> anyhow::Result<()> {
         config.page_size, config.diag_level, config.text_mode);
 
     let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode)?;
+    let cache = catalog::cache::CatalogCache::new(catalog);
+    log::info!("catalog cache built");
 
     println!("RustDB — interactive SQL shell");
     println!("Type SQL queries or \\q to quit.\n");
 
-    repl(&catalog)?;
+    repl(&cache)?;
 
     Ok(())
 }
 
-fn repl(catalog: &catalog::types::Catalog) -> anyhow::Result<()> {
+fn repl(cache: &catalog::cache::CatalogCache) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
@@ -73,7 +75,7 @@ fn repl(catalog: &catalog::types::Catalog) -> anyhow::Result<()> {
         match sql::parser::parse(input) {
             Ok(stmts) => {
                 for stmt in &stmts {
-                    match sql::executor::execute(stmt, catalog) {
+                    match sql::executor::execute(stmt, cache) {
                         Ok(rs) => println!("{}\n", rs.display()),
                         Err(e) => println!("Error: {e}\n"),
                     }

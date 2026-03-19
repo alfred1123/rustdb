@@ -1,15 +1,17 @@
+use std::collections::HashMap;
+
 use sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement, TableFactor,
 };
 
-use crate::catalog::types::Catalog;
+use crate::catalog::cache::CatalogCache;
 use crate::error::{sql_error, Result, SqlState};
 use crate::sql::types::{ResultSet, TableRef, Value};
 
-/// Execute a parsed SQL statement against the catalog.
-pub fn execute(stmt: &Statement, catalog: &Catalog) -> Result<ResultSet> {
+/// Execute a parsed SQL statement against the catalog cache.
+pub fn execute(stmt: &Statement, cache: &CatalogCache) -> Result<ResultSet> {
     match stmt {
-        Statement::Query(query) => execute_query(query, catalog),
+        Statement::Query(query) => execute_query(query, cache),
         _ => Err(sql_error(
             SqlState::FeatureNotSupported,
             format!("unsupported statement: {stmt}"),
@@ -19,7 +21,7 @@ pub fn execute(stmt: &Statement, catalog: &Catalog) -> Result<ResultSet> {
 
 fn execute_query(
     query: &sqlparser::ast::Query,
-    catalog: &Catalog,
+    cache: &CatalogCache,
 ) -> Result<ResultSet> {
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -57,25 +59,29 @@ fn execute_query(
 
     log::debug!("SELECT from {}.{}", table_ref.schema, table_ref.table);
 
-    // Get all columns and rows for the resolved table.
-    let (all_columns, all_rows) = load_table_data(catalog, &table_ref)?;
+    // O(1) lookup: get pre-materialized table data from cache.
+    let cached = cache.get_table_data(&table_ref.schema, &table_ref.table)
+        .ok_or_else(|| sql_error(
+            SqlState::TableNotFound,
+            format!("table {}.{} not found", table_ref.schema, table_ref.table),
+        ))?;
 
-    // Resolve SELECT list.
+    // Resolve SELECT list using O(1) column index.
     let (selected_columns, selected_indices) =
-        resolve_select_list(&select.projection, &all_columns)?;
+        resolve_select_list(&select.projection, &cached.column_names, &cached.column_index)?;
 
     // Apply WHERE filter.
     let filtered_rows = match &select.selection {
         Some(expr) => {
             let mut result = Vec::new();
-            for row in &all_rows {
-                if eval_where(expr, &all_columns, row)? {
+            for row in &cached.rows {
+                if eval_where(expr, &cached.column_index, row)? {
                     result.push(row.clone());
                 }
             }
             result
         }
-        None => all_rows,
+        None => cached.rows.clone(),
     };
 
     // Project selected columns.
@@ -90,114 +96,12 @@ fn execute_query(
     })
 }
 
-/// Load all data for a catalog table into column names + row values.
-fn load_table_data(
-    catalog: &Catalog,
-    table_ref: &TableRef,
-) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    match table_ref.table.as_str() {
-        "SYSTABLESPACES" => {
-            let cols = vec![
-                "TBSPACEID".into(), "TBSPACE".into(), "TBSPACETYPE".into(),
-                "DATATYPE".into(), "PAGESIZE".into(), "STATE".into(),
-                "BUFFERPOOLID".into(),
-            ];
-            let rows: Vec<Vec<Value>> = catalog
-                .tablespaces
-                .iter()
-                .map(|ts| {
-                    vec![
-                        Value::Integer(ts.tbspaceid),
-                        Value::Str(ts.tbspace.clone()),
-                        Value::Str(ts.tbspacetype.clone()),
-                        Value::Str(ts.datatype.clone()),
-                        Value::Integer(ts.pagesize),
-                        Value::Str(ts.state.clone()),
-                        Value::Integer(ts.bufferpoolid),
-                    ]
-                })
-                .collect();
-            Ok((cols, rows))
-        }
-        "SYSSCHEMAS" => {
-            let cols = vec!["NAME".into()];
-            let rows: Vec<Vec<Value>> = catalog
-                .schemas
-                .iter()
-                .map(|s| vec![Value::Str(s.name.clone())])
-                .collect();
-            Ok((cols, rows))
-        }
-        "SYSTABLES" => {
-            let cols = vec![
-                "NAME".into(), "SCHEMANAME".into(),
-                "TBSPACEID".into(), "COLCOUNT".into(),
-            ];
-            let rows: Vec<Vec<Value>> = catalog
-                .tables
-                .iter()
-                .map(|t| {
-                    vec![
-                        Value::Str(t.name.clone()),
-                        Value::Str(t.schemaname.clone()),
-                        Value::SmallInt(t.tbspaceid),
-                        Value::SmallInt(t.colcount),
-                    ]
-                })
-                .collect();
-            Ok((cols, rows))
-        }
-        "SYSCOLUMNS" => {
-            let cols = vec![
-                "NAME".into(), "TABNAME".into(), "SCHEMANAME".into(),
-                "ORDINAL".into(), "TYPENAME".into(), "NULLABLE".into(),
-            ];
-            let rows: Vec<Vec<Value>> = catalog
-                .columns
-                .iter()
-                .map(|c| {
-                    vec![
-                        Value::Str(c.name.clone()),
-                        Value::Str(c.tabname.clone()),
-                        Value::Str(c.schemaname.clone()),
-                        Value::SmallInt(c.ordinal),
-                        Value::Str(c.typename.clone()),
-                        Value::Bool(c.nullable),
-                    ]
-                })
-                .collect();
-            Ok((cols, rows))
-        }
-        "SYSBUFFERPOOLS" => {
-            let cols = vec![
-                "BPID".into(), "BPNAME".into(),
-                "PAGESIZE".into(), "NPAGES".into(),
-            ];
-            let rows: Vec<Vec<Value>> = catalog
-                .bufferpools
-                .iter()
-                .map(|bp| {
-                    vec![
-                        Value::Integer(bp.bpid),
-                        Value::Str(bp.bpname.clone()),
-                        Value::Integer(bp.pagesize),
-                        Value::Integer(bp.npages),
-                    ]
-                })
-                .collect();
-            Ok((cols, rows))
-        }
-        _ => Err(sql_error(
-            SqlState::TableNotFound,
-            format!("table {}.{} not found", table_ref.schema, table_ref.table),
-        )),
-    }
-}
-
 /// Resolve the SELECT list to column names and their indices.
+/// Uses the column_index HashMap for O(1) name→index resolution.
 fn resolve_select_list(
     projection: &[SelectItem],
     all_columns: &[String],
+    column_index: &HashMap<String, usize>,
 ) -> Result<(Vec<String>, Vec<usize>)> {
     let mut names = Vec::new();
     let mut indices = Vec::new();
@@ -212,12 +116,9 @@ fn resolve_select_list(
             }
             SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                 let col_name = ident.value.to_uppercase();
-                let idx = all_columns
-                    .iter()
-                    .position(|c| c == &col_name)
-                    .ok_or_else(|| {
-                        sql_error(SqlState::ColumnNotFound, format!("column {col_name} not found"))
-                    })?;
+                let idx = *column_index.get(&col_name).ok_or_else(|| {
+                    sql_error(SqlState::ColumnNotFound, format!("column {col_name} not found"))
+                })?;
                 names.push(col_name);
                 indices.push(idx);
             }
@@ -227,12 +128,9 @@ fn resolve_select_list(
                     .last()
                     .map(|i| i.value.to_uppercase())
                     .ok_or_else(|| sql_error(SqlState::SyntaxError, "empty identifier"))?;
-                let idx = all_columns
-                    .iter()
-                    .position(|c| c == &col_name)
-                    .ok_or_else(|| {
-                        sql_error(SqlState::ColumnNotFound, format!("column {col_name} not found"))
-                    })?;
+                let idx = *column_index.get(&col_name).ok_or_else(|| {
+                    sql_error(SqlState::ColumnNotFound, format!("column {col_name} not found"))
+                })?;
                 names.push(col_name);
                 indices.push(idx);
             }
@@ -249,9 +147,10 @@ fn resolve_select_list(
 }
 
 /// Evaluate a WHERE expression against a row. Supports simple comparisons.
+/// Uses column_index HashMap for O(1) column resolution.
 fn eval_where(
     expr: &Expr,
-    columns: &[String],
+    column_index: &HashMap<String, usize>,
     row: &[Value],
 ) -> Result<bool> {
     match expr {
@@ -259,21 +158,21 @@ fn eval_where(
             use sqlparser::ast::BinaryOperator;
             match op {
                 BinaryOperator::And => {
-                    Ok(eval_where(left, columns, row)?
-                        && eval_where(right, columns, row)?)
+                    Ok(eval_where(left, column_index, row)?
+                        && eval_where(right, column_index, row)?)
                 }
                 BinaryOperator::Or => {
-                    Ok(eval_where(left, columns, row)?
-                        || eval_where(right, columns, row)?)
+                    Ok(eval_where(left, column_index, row)?
+                        || eval_where(right, column_index, row)?)
                 }
                 BinaryOperator::Eq => {
-                    let l = eval_expr(left, columns, row)?;
-                    let r = eval_expr(right, columns, row)?;
+                    let l = eval_expr(left, column_index, row)?;
+                    let r = eval_expr(right, column_index, row)?;
                     Ok(values_eq(&l, &r))
                 }
                 BinaryOperator::NotEq => {
-                    let l = eval_expr(left, columns, row)?;
-                    let r = eval_expr(right, columns, row)?;
+                    let l = eval_expr(left, column_index, row)?;
+                    let r = eval_expr(right, column_index, row)?;
                     Ok(!values_eq(&l, &r))
                 }
                 _ => Err(sql_error(
@@ -290,18 +189,18 @@ fn eval_where(
 }
 
 /// Evaluate a scalar expression to a Value.
+/// Uses column_index HashMap for O(1) column resolution.
 fn eval_expr(
     expr: &Expr,
-    columns: &[String],
+    column_index: &HashMap<String, usize>,
     row: &[Value],
 ) -> Result<Value> {
     match expr {
         Expr::Identifier(ident) => {
             let name = ident.value.to_uppercase();
-            let idx = columns
-                .iter()
-                .position(|c| c == &name)
-                .ok_or_else(|| sql_error(SqlState::ColumnNotFound, format!("column {name} not found")))?;
+            let idx = *column_index.get(&name).ok_or_else(|| {
+                sql_error(SqlState::ColumnNotFound, format!("column {name} not found"))
+            })?;
             Ok(row[idx].clone())
         }
         Expr::CompoundIdentifier(parts) => {
@@ -309,10 +208,9 @@ fn eval_expr(
                 .last()
                 .map(|i| i.value.to_uppercase())
                 .ok_or_else(|| sql_error(SqlState::SyntaxError, "empty identifier"))?;
-            let idx = columns
-                .iter()
-                .position(|c| c == &name)
-                .ok_or_else(|| sql_error(SqlState::ColumnNotFound, format!("column {name} not found")))?;
+            let idx = *column_index.get(&name).ok_or_else(|| {
+                sql_error(SqlState::ColumnNotFound, format!("column {name} not found"))
+            })?;
             Ok(row[idx].clone())
         }
         Expr::Value(val) => match &val.value {
@@ -364,11 +262,12 @@ fn values_eq(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::cache::CatalogCache;
     use crate::sql::parser;
 
-    fn test_catalog() -> Catalog {
+    fn test_cache() -> CatalogCache {
         use crate::catalog::types::*;
-        Catalog {
+        let catalog = Catalog {
             tablespaces: vec![
                 Tablespace {
                     tbspaceid: 1,
@@ -415,67 +314,68 @@ mod tests {
                     npages: 128,
                 },
             ],
-        }
+        };
+        CatalogCache::new(catalog)
     }
 
     #[test]
     fn select_star_from_systablespaces() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse("SELECT * FROM SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.columns.len(), 7);
         assert_eq!(rs.rows.len(), 1);
     }
 
     #[test]
     fn select_specific_columns() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse("SELECT tbspace, tbspaceid FROM SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.columns, vec!["TBSPACE", "TBSPACEID"]);
         assert_eq!(rs.rows.len(), 1);
     }
 
     #[test]
     fn select_with_schema_prefix() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts =
             parser::parse("SELECT * FROM RQSYS.SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.rows.len(), 1);
     }
 
     #[test]
     fn select_with_where_eq() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse(
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 1",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "SYSTBSP");
     }
 
     #[test]
     fn select_with_where_no_match() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse(
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 99",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.rows.len(), 0);
     }
 
     #[test]
     fn select_with_string_where() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse(
             "SELECT * FROM SYSCOLUMNS WHERE tabname = 'SYSTABLESPACES'",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &catalog).unwrap();
+        let rs = execute(&stmts[0], &cache).unwrap();
         assert_eq!(rs.rows.len(), 2);
     }
 
@@ -502,49 +402,49 @@ mod tests {
 
     #[test]
     fn error_table_not_found() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse("SELECT * FROM NONEXISTENT").unwrap();
-        assert_sqlstate(execute(&stmts[0], &catalog), SqlState::TableNotFound);
+        assert_sqlstate(execute(&stmts[0], &cache), SqlState::TableNotFound);
     }
 
     #[test]
     fn error_column_not_found() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts =
             parser::parse("SELECT bogus FROM SYSTABLESPACES").unwrap();
-        assert_sqlstate(execute(&stmts[0], &catalog), SqlState::ColumnNotFound);
+        assert_sqlstate(execute(&stmts[0], &cache), SqlState::ColumnNotFound);
     }
 
     #[test]
     fn error_column_not_found_in_where() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse(
             "SELECT * FROM SYSTABLESPACES WHERE bogus = 1",
         )
         .unwrap();
-        assert_sqlstate(execute(&stmts[0], &catalog), SqlState::ColumnNotFound);
+        assert_sqlstate(execute(&stmts[0], &cache), SqlState::ColumnNotFound);
     }
 
     #[test]
     fn error_unsupported_insert() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts = parser::parse(
             "INSERT INTO SYSTABLESPACES VALUES (4, 'X', 'D', 4096, 'N')",
         )
         .unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &catalog),
+            execute(&stmts[0], &cache),
             SqlState::FeatureNotSupported,
         );
     }
 
     #[test]
     fn error_unsupported_delete() {
-        let catalog = test_catalog();
+        let cache = test_cache();
         let stmts =
             parser::parse("DELETE FROM SYSTABLESPACES WHERE tbspaceid = 1").unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &catalog),
+            execute(&stmts[0], &cache),
             SqlState::FeatureNotSupported,
         );
     }
