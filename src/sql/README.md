@@ -55,12 +55,37 @@ INSERT serialization works the same way in reverse via `RowWriter`.
 
 ## Planned
 
-- Query planner producing a logical plan
-- Volcano-style iterator executor
-- UPDATE statement
-- Expressions in SELECT list (functions, arithmetic)
-- ORDER BY, GROUP BY, HAVING
-- JOINs
+### Near-term — SQL Coverage Expansion
+
+- [ ] Comparison operators in WHERE (`<`, `>`, `<=`, `>=`)
+- [ ] `IS NULL` / `IS NOT NULL` in WHERE
+- [ ] `NOT` operator in WHERE
+- [ ] `BIGINT` type in row serialization/deserialization
+- [ ] `BOOLEAN` type (`TRUE`/`FALSE` literals + serde)
+- [ ] `COUNT(*)` aggregate (no GROUP BY)
+- [ ] Column aliases (`SELECT col AS name`)
+- [ ] `LIMIT` clause
+- [ ] `OFFSET` clause
+- [ ] `ORDER BY` clause
+- [ ] `UPDATE` statement
+
+### Medium-term
+
+- [ ] `LIKE` pattern matching in WHERE
+- [ ] `IN (list)` expression in WHERE
+- [ ] `BETWEEN` expression in WHERE
+- [ ] Arithmetic expressions (`+`, `-`, `*`, `/`) in SELECT and WHERE
+- [ ] `DISTINCT` keyword
+- [ ] `CREATE TABLE` / `DROP TABLE` (DDL)
+
+### Longer-term
+
+- [ ] Query planner producing a logical plan
+- [ ] Volcano-style iterator executor
+- [ ] `GROUP BY` + aggregate functions (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`)
+- [ ] `HAVING` clause
+- [ ] JOINs (nested-loop)
+- [ ] Subqueries
 
 ## TODO — Multi-threaded Executor
 
@@ -74,11 +99,15 @@ target scale (≤10K tables).
 
 Errors follow the ANSI SQL SQLSTATE convention (5-character codes):
 
-| Code  | Meaning                      | Example trigger                      |
-|-------|------------------------------|--------------------------------------|
-| 42601 | Parse error                  | `SELEC * FORM table`                 |
-| 42000 | Syntax error                 | Invalid table reference              |
-| 42S02 | Table not found              | `SELECT * FROM NONEXISTENT`          |
-| 42S22 | Column not found             | `SELECT bogus FROM SYSTABLESPACES`   |
-| 0A000 | Feature not supported        | `UPDATE ...`, JOINs                  |
-| 22000 | Data exception               | Unsupported literal type             |
+| Code  | Meaning                            | Example trigger                              |
+|-------|------------------------------------|----------------------------------------------|
+| 21S01 | Insert value list mismatch         | `INSERT INTO t VALUES (1)` when t has 3 cols |
+| 22000 | Data exception (general)           | Unsupported literal type                     |
+| 22003 | Numeric value out of range         | Number too large for target column type      |
+| 22005 | Error in assignment (type mismatch)| `INSERT INTO t (int_col) VALUES ('abc')`     |
+| 23502 | NOT NULL violation                 | `INSERT` with NULL for non-nullable column   |
+| 42000 | Syntax error                       | Invalid table reference, empty identifier    |
+| 42601 | Parse error                        | `SELEC * FORM table`                         |
+| 42S02 | Table not found                    | `SELECT * FROM NONEXISTENT`                  |
+| 42S22 | Column not found                   | `SELECT bogus FROM SYSTABLESPACES`           |
+| 0A000 | Feature not supported              | `UPDATE ...`, JOINs, unsupported expressions |

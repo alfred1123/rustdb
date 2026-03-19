@@ -35,8 +35,16 @@ pub enum SqlState {
     GroupingError,
     /// 0A000 — Feature not supported
     FeatureNotSupported,
-    /// 22000 — Data exception
+    /// 22000 — Data exception (general)
     DataException,
+    /// 22003 — Numeric value out of range
+    NumericValueOutOfRange,
+    /// 22005 — Error in assignment (type mismatch)
+    AssignmentError,
+    /// 23502 — NOT NULL integrity constraint violation
+    NotNullViolation,
+    /// 21S01 — Insert value list does not match column list
+    InsertValueListMismatch,
     /// 26000 — Invalid SQL statement name
     InvalidSqlStatement,
 }
@@ -51,6 +59,10 @@ impl std::fmt::Display for SqlState {
             SqlState::GroupingError => "42803",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::DataException => "22000",
+            SqlState::NumericValueOutOfRange => "22003",
+            SqlState::AssignmentError => "22005",
+            SqlState::NotNullViolation => "23502",
+            SqlState::InsertValueListMismatch => "21S01",
             SqlState::InvalidSqlStatement => "26000",
         };
         write!(f, "{code}")

@@ -160,7 +160,7 @@ fn execute_insert(
     for row_exprs in rows_ast {
         if row_exprs.len() != col_order.len() {
             return Err(sql_error(
-                SqlState::SyntaxError,
+                SqlState::InsertValueListMismatch,
                 format!(
                     "expected {} values, got {}",
                     col_order.len(),
@@ -331,13 +331,13 @@ fn serialize_row(values: &[Value], columns: &[Column]) -> Result<Vec<u8>> {
             (Value::BigInt(v), "SMALLINT") => writer.write_i16(*v as i16),
             (Value::Null, _) => {
                 return Err(sql_error(
-                    SqlState::DataException,
+                    SqlState::NotNullViolation,
                     format!("NULL not allowed for column {}", col.name),
                 ))
             }
             _ => {
                 return Err(sql_error(
-                    SqlState::DataException,
+                    SqlState::AssignmentError,
                     format!(
                         "type mismatch for column {}: cannot store {} as {}",
                         col.name, val, col.typename
@@ -836,5 +836,47 @@ mod tests {
         let err = parser::parse("");
         assert!(err.is_ok());
         assert!(err.unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_insert_value_list_mismatch() {
+        let (cache, mut tsm, _dir) = test_fixture("err_val_cnt");
+        // SYSTABLESPACES has 7 columns but we provide only 2 values.
+        let stmts = parser::parse(
+            "INSERT INTO SYSTABLESPACES VALUES (1, 'X')",
+        )
+        .unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &cache, &mut tsm),
+            SqlState::InsertValueListMismatch,
+        );
+    }
+
+    #[test]
+    fn error_not_null_violation() {
+        let (cache, mut tsm, _dir) = test_fixture("err_null");
+        // SYSSCHEMAS has 1 column (NAME VARCHAR). Insert NULL.
+        let stmts = parser::parse(
+            "INSERT INTO SYSSCHEMAS VALUES (NULL)",
+        )
+        .unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &cache, &mut tsm),
+            SqlState::NotNullViolation,
+        );
+    }
+
+    #[test]
+    fn error_type_mismatch() {
+        let (cache, mut tsm, _dir) = test_fixture("err_type");
+        // SYSTABLESPACES first column is SMALLINT. Insert a string.
+        let stmts = parser::parse(
+            "INSERT INTO SYSTABLESPACES VALUES ('not_a_number', 'X', 'D', 'A', 4096, 'N', 1)",
+        )
+        .unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &cache, &mut tsm),
+            SqlState::AssignmentError,
+        );
     }
 }
