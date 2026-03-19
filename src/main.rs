@@ -39,15 +39,24 @@ fn main() -> anyhow::Result<()> {
     let cache = catalog::cache::CatalogCache::new(catalog);
     log::info!("catalog cache built");
 
+    let mut tsm = storage::tablespace::TablespaceManager::open(&data_dir, &cache)?;
+    log::info!("tablespace manager opened");
+
     println!("RustDB — interactive SQL shell");
     println!("Type SQL queries or \\q to quit.\n");
 
-    repl(&cache)?;
+    repl(&cache, &mut tsm)?;
+
+    tsm.flush_all()?;
+    log::info!("shutdown complete");
 
     Ok(())
 }
 
-fn repl(cache: &catalog::cache::CatalogCache) -> anyhow::Result<()> {
+fn repl(
+    cache: &catalog::cache::CatalogCache,
+    tsm: &mut storage::tablespace::TablespaceManager,
+) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
@@ -75,7 +84,7 @@ fn repl(cache: &catalog::cache::CatalogCache) -> anyhow::Result<()> {
         match sql::parser::parse(input) {
             Ok(stmts) => {
                 for stmt in &stmts {
-                    match sql::executor::execute(stmt, cache) {
+                    match sql::executor::execute(stmt, cache, tsm) {
                         Ok(rs) => println!("{}\n", rs.display()),
                         Err(e) => println!("Error: {e}\n"),
                     }

@@ -44,7 +44,7 @@ and networking are in progress.
 | **Buffer pool** | Named pools, per-tablespace routing | Single page cache | `shared_buffers` | Memory-mapped |
 | **Deployment** | Single binary, no runtime | Single file, no runtime | Server + client + extensions | Single library |
 | **Concurrency** | Single-session (multi-session planned) | File-level locking / WAL mode | Full MVCC | Single-writer |
-| **SQL coverage** | SELECT + WHERE (DML in progress) | Full SQL | Full SQL + extensions | Full SQL (analytical) |
+| **SQL coverage** | SELECT, INSERT, DELETE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
 | **Transactions** | Planned (ARIES-style WAL) | WAL or journal | WAL + MVCC | WAL |
 | **Codebase size** | ~3K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
@@ -209,8 +209,34 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 - [x] Self-describing system catalog (5 tables, page-based storage)
 - [x] In-memory catalog cache with O(1) lookups
 - [x] SQL REPL with SELECT + WHERE
-- [ ] INSERT / UPDATE / DELETE in SQL executor
-- [ ] CREATE TABLE / DROP TABLE (DDL)
+- [x] INSERT / DELETE in SQL executor (via TablespaceManager)
+
+### SQL Coverage Expansion
+
+- [ ] Comparison operators in WHERE (`<`, `>`, `<=`, `>=`)
+- [ ] `IS NULL` / `IS NOT NULL` in WHERE
+- [ ] `NOT` operator in WHERE
+- [ ] `BIGINT` type in row serialization/deserialization
+- [ ] `BOOLEAN` type (`TRUE`/`FALSE` literals + serde)
+- [ ] `COUNT(*)` aggregate (no GROUP BY)
+- [ ] Column aliases (`SELECT col AS name`)
+- [ ] `LIMIT` clause
+- [ ] `OFFSET` clause
+- [ ] `ORDER BY` clause
+- [ ] `UPDATE` statement
+- [ ] `LIKE` pattern matching in WHERE
+- [ ] `IN (list)` expression in WHERE
+- [ ] `BETWEEN` expression in WHERE
+- [ ] Arithmetic expressions (`+`, `-`, `*`, `/`) in SELECT and WHERE
+- [ ] `DISTINCT` keyword
+- [ ] `CREATE TABLE` / `DROP TABLE` (DDL)
+- [ ] `GROUP BY` + aggregate functions (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`)
+- [ ] `HAVING` clause
+- [ ] JOINs (nested-loop)
+- [ ] Subqueries
+
+### Infrastructure
+
 - [ ] Write-ahead log (WAL) with ARIES-style recovery
 - [ ] MVCC or lock-based concurrency control
 - [ ] B-tree indexes

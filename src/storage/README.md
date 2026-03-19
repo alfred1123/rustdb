@@ -635,17 +635,19 @@ files. The page-based path is the `text_mode=false` default.
 `.DAT` files that are incompatible with the new page-based loader. Delete
 the old database directory and re-bootstrap to create page-based files.
 
-### Phase 6 — Wire Up to SQL Executor
+### Phase 6 — Wire Up to SQL Executor ✅
 
-Replace the hardcoded `load_table_data()` in `executor.rs` with calls to
-`TablespaceManager`:
+The executor now reads all data through `TablespaceManager` instead of
+pre-materialized `CachedTable` rows:
 
-- `load_table_data()` calls `table_scan()` to get raw row bytes
-- Deserializes each row using `RowReader` + column metadata from `SYSCOLUMNS`
-- Returns `(Vec<String>, Vec<Vec<Value>>)` as today
+- **SELECT:** `table_scan()` → generic `deserialize_row()` using column
+  metadata from `CatalogCache.get_columns()`
+- **INSERT:** `serialize_row()` → `insert_row()` via TSM
+- **DELETE:** `table_scan()` + WHERE filter → `delete_row()` by RID
 
-This makes `SELECT` work against any table — catalog or user — without
-per-table match arms.
+This makes SELECT, INSERT, and DELETE work against any table — catalog or
+user — without per-table match arms. Column typename drives serialization
+(SMALLINT→i16, INTEGER→i32, CHAR/VARCHAR→string).
 
 ## Dependency Order
 
