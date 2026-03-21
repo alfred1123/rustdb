@@ -86,6 +86,13 @@ cargo run -- --data-dir ./TESTDB
 - **Catalog identifiers:** Always uppercase (e.g., `RQSYS`, `SYSTABLES`).
 - **Page size default:** 4096 bytes (configurable per tablespace).
 - **Testing:** Unit tests in `#[cfg(test)]` modules; integration tests in `tests/`.
+  - **Unit tests** (`#[cfg(test)]`): Test individual module internals — pure logic,
+    in-memory state, serialization, cache lookups. May use `test_fixture` for bootstrapped
+    temp directories when testing within a single module.
+  - **Integration tests** (`tests/`): Test the full stack across module boundaries —
+    bootstrap → load → execute SQL → verify results. Use these for: persistence across
+    restarts, multi-statement sessions, different SQLDBCONF configurations, DDL + DML
+    workflows, and anything that exercises the public API end-to-end.
 - **Logging:** Use the `log` crate (`log::info!`, `log::debug!`, `log::warn!`, `log::error!`).
   Do not use `println!` for operational messages — reserve `println!` for user-facing output only.
   Log levels: `error` for failures, `warn` for recoverable issues, `info` for key milestones,
@@ -106,6 +113,19 @@ cargo run -- --data-dir ./TESTDB
    default. Uncommitted-read (`READ UNCOMMITTED` isolation) may be added later
    as a localised relaxation of the latch check — the enum and guard structure
    are designed for that extension.
+7. **Configuration is centralized in `admin/SQLDBCONF`.**  All tunable database
+   parameters — page size, diagnostic level, text mode, default schema, default
+   tablespace, system schema name — live in SQLDBCONF and are read into `DbConfig`
+   at startup.  Never hardcode a config value as a Rust constant; add it to
+   `DbConfig` so every consumer reads from one place.  Functions should accept
+   `&DbConfig` (or obtain it from `CatalogCache::config()`) rather than
+   individual config parameters.
+8. **The RQSYS system catalog is the single source of truth for metadata.**
+   Use the catalog tables (SYSTABLES, SYSCOLUMNS, SYSSCHEMAS, SYSTABLESPACES,
+   SYSBUFFERPOOLS) for all metadata lookups.  The system schema name itself
+   comes from `DbConfig::sys_schema` (written as `SYS_SCHEMA` in SQLDBCONF),
+   never hardcoded.  When you need metadata, query `CatalogCache` — do not
+   reconstruct it from files, constants, or ad-hoc logic.
 
 ## Key Dependencies (planned)
 

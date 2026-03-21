@@ -6,7 +6,7 @@ System catalog module — manages the database's internal metadata.
 
 | File           | Purpose                                                    |
 |----------------|------------------------------------------------------------|
-| `mod.rs`       | Module root; exports `SYSTEM_SCHEMA` constant (`RQSYS`)   |
+| `mod.rs`       | Module root; re-exports submodules                         |
 | `types.rs`     | Struct definitions: `Tablespace`, `Schema`, `Table`, `Column`, `BufferPool`, `Catalog`; SQL type-system limits (`MIN_CHAR_LENGTH`, `MAX_CHAR_LENGTH`) |
 | `row.rs`       | `RowReader` / `RowWriter` — binary serialization using u64 LE length-prefixed fields; row-format constants (`LENGTH_PREFIX_SIZE`, `MIN_COLUMN_BYTES`) |
 | `config.rs`    | `DbConfig` — reads/writes the `admin/SQLDBCONF` database configuration file |
@@ -39,6 +39,7 @@ Written at bootstrap and read on every subsequent startup. Format: `KEY = VALUE`
 | `TEXT_MODE`  | `FALSE`   | `TRUE` = TSV text `.DAT` files, `FALSE` = binary.         |
 | `DFT_SCHEMA` | `PUBLIC`  | Default schema for unqualified table names (DB2: `DFT_SCHEMA`). |
 | `DFT_TBSP`  | `USERTBSP` | Default tablespace for user-created tables (DB2: `DFT_TBSP`). Resolved to tablespace ID via catalog at runtime. |
+| `SYS_SCHEMA` | `RQSYS`   | System catalog schema name. Do not change after bootstrap. All consumers read this via `DbConfig::sys_schema`. |
 
 ## Data Representations
 

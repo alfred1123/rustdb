@@ -19,6 +19,9 @@ const DEFAULT_DFT_SCHEMA: &str = "PUBLIC";
 /// Default tablespace name for user tables (DB2: DFT_TBSP).
 const DEFAULT_DFT_TABLESPACE: &str = "USERTBSP";
 
+/// Default system catalog schema name.
+const DEFAULT_SYS_SCHEMA: &str = "RQSYS";
+
 /// Database configuration parameters stored in `admin/SQLDBCONF`.
 ///
 /// Follows the DB2 convention of a per-database configuration file.
@@ -35,6 +38,8 @@ pub struct DbConfig {
     pub default_schema: String,
     /// Default tablespace name for user-created tables (DB2: DFT_TBSP).
     pub default_tablespace: String,
+    /// System catalog schema name (e.g. `RQSYS`).  All catalog tables live here.
+    pub sys_schema: String,
 }
 
 impl Default for DbConfig {
@@ -45,6 +50,7 @@ impl Default for DbConfig {
             text_mode: false,
             default_schema: DEFAULT_DFT_SCHEMA.to_string(),
             default_tablespace: DEFAULT_DFT_TABLESPACE.to_string(),
+            sys_schema: DEFAULT_SYS_SCHEMA.to_string(),
         }
     }
 }
@@ -72,12 +78,16 @@ DFT_SCHEMA = {}
 
 -- Default tablespace for user-created tables (DB2: DFT_TBSP).
 DFT_TBSP = {}
+
+-- System catalog schema name.  Do not change after bootstrap.
+SYS_SCHEMA = {}
 ",
             self.page_size,
             self.diag_level,
             if self.text_mode { "TRUE" } else { "FALSE" },
             self.default_schema,
             self.default_tablespace,
+            self.sys_schema,
         );
         fs::write(&path, content)?;
         log::info!("wrote {}", path.display());
@@ -121,12 +131,18 @@ DFT_TBSP = {}
             .cloned()
             .unwrap_or_else(|| DEFAULT_DFT_TABLESPACE.to_string());
 
+        let sys_schema = map
+            .get("SYS_SCHEMA")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_SYS_SCHEMA.to_string());
+
         Ok(Self {
             page_size,
             diag_level,
             text_mode,
             default_schema,
             default_tablespace,
+            sys_schema,
         })
     }
 }

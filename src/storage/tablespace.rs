@@ -637,7 +637,7 @@ mod tests {
         let cfg = crate::catalog::config::DbConfig::default();
         crate::catalog::bootstrap::bootstrap(&dir.path, &cfg).unwrap();
         let catalog =
-            crate::catalog::loader::load_catalog(&dir.path, false, cfg.page_size).unwrap();
+            crate::catalog::loader::load_catalog(&dir.path, &cfg).unwrap();
         let cache = crate::catalog::cache::CatalogCache::new(catalog, cfg);
 
         let tsm = TablespaceManager::open(&dir.path, &cache).unwrap();

@@ -1,12 +1,9 @@
-mod catalog;
-mod error;
-mod server;
-mod sql;
-mod storage;
-mod transaction;
-
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+
+use rustdb::catalog;
+use rustdb::sql;
+use rustdb::storage;
 
 use catalog::config::DbConfig;
 
@@ -17,11 +14,9 @@ fn main() -> anyhow::Result<()> {
     let (data_dir, text_mode) = parse_args()?;
     log::info!("data_dir={}, text_mode={}", data_dir.display(), text_mode);
 
-    let systables_path = data_dir
-        .join("systbsp")
-        .join(format!("{}.SYSTABLES.0.DAT", catalog::SYSTEM_SCHEMA));
+    let sqldbconf_path = data_dir.join("admin").join("SQLDBCONF");
 
-    let config = if !systables_path.exists() {
+    let config = if !sqldbconf_path.exists() {
         log::info!("bootstrapping new database at {}", data_dir.display());
         let cfg = DbConfig {
             text_mode,
@@ -35,7 +30,7 @@ fn main() -> anyhow::Result<()> {
     log::info!("config: PAGESIZE={}, DIAGLEVEL={}, TEXT_MODE={}",
         config.page_size, config.diag_level, config.text_mode);
 
-    let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode, config.page_size)?;
+    let catalog = catalog::loader::load_catalog(&data_dir, &config)?;
     let mut cache = catalog::cache::CatalogCache::new(catalog, config);
     log::info!("catalog cache built");
 

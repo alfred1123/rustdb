@@ -71,7 +71,7 @@ centralized in three places:
 
 | Constant | Location | Purpose |
 |----------|----------|---------|
-| `SYSTEM_SCHEMA` | `catalog/mod.rs` | System catalog schema name (`RQSYS`) |
+| `SYS_SCHEMA` | `SQLDBCONF` → `DbConfig` | System catalog schema name (`RQSYS`) |
 | `LENGTH_PREFIX_SIZE` | `catalog/row.rs` | Row wire-format overhead per field (8 bytes) |
 | `MIN_COLUMN_BYTES` | `catalog/row.rs` | Minimum serialized bytes per column (9) |
 | `MIN_CHAR_LENGTH` | `catalog/types.rs` | Minimum CHAR/VARCHAR length (1) |

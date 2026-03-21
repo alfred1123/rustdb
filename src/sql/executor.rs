@@ -4,7 +4,6 @@ use sqlparser::ast::{
     ColumnOption, Expr, SelectItem, SetExpr, Statement, TableFactor,
 };
 
-use crate::catalog;
 use crate::catalog::cache::CatalogCache;
 use crate::catalog::row::{RowReader, RowWriter, LENGTH_PREFIX_SIZE, MIN_COLUMN_BYTES};
 use crate::catalog::types::{Column, Schema, Table, MIN_CHAR_LENGTH, MAX_CHAR_LENGTH};
@@ -384,10 +383,10 @@ fn execute_create_table(
     // Reject creating tables in the system catalog schema (only when
     // explicitly schema-qualified, e.g., CREATE TABLE RQSYS.foo).
     let explicit_schema = create.name.0.len() > 1;
-    if explicit_schema && schema == catalog::SYSTEM_SCHEMA {
+    if explicit_schema && *schema == cache.config().sys_schema {
         return Err(sql_error(
             SqlState::SystemSchemaViolation,
-            format!("cannot create user table in system schema {}", catalog::SYSTEM_SCHEMA),
+            format!("cannot create user table in system schema {}", cache.config().sys_schema),
         ));
     }
 
@@ -466,7 +465,7 @@ fn execute_create_table(
     if !cache.has_schema(schema) {
         let mut w = RowWriter::new();
         w.write_string(schema);
-        tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSSCHEMAS", &w.finish())?;
+        tsm.insert_row(&cache.config().sys_schema, "SYSSCHEMAS", &w.finish())?;
         cache.register_schema(Schema { name: schema.clone() });
     }
 
@@ -476,7 +475,7 @@ fn execute_create_table(
     w.write_string(schema);
     w.write_i16(tbspaceid);
     w.write_i16(colcount);
-    tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSTABLES", &w.finish())?;
+    tsm.insert_row(&cache.config().sys_schema, "SYSTABLES", &w.finish())?;
 
     // 3. Insert one row per column into SYSCOLUMNS.
     for col in &columns {
@@ -487,7 +486,7 @@ fn execute_create_table(
         w.write_i16(col.ordinal);
         w.write_string(&col.typename);
         w.write_bool(col.nullable);
-        tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSCOLUMNS", &w.finish())?;
+        tsm.insert_row(&cache.config().sys_schema, "SYSCOLUMNS", &w.finish())?;
     }
 
     // 4. Create the empty heap file and register in TSM.
@@ -597,7 +596,7 @@ fn resolve_with_search_path(table_ref: TableRef, cache: &CatalogCache) -> TableR
     // Only search when the user didn't explicitly qualify.
     let default_schema = &cache.config().default_schema;
     if table_ref.schema == *default_schema {
-        for sch in [default_schema.as_str(), catalog::SYSTEM_SCHEMA] {
+        for sch in [default_schema.as_str(), cache.config().sys_schema.as_str()] {
             if cache.get_table(sch, &table_ref.table).is_some() {
                 return TableRef {
                     schema: sch.to_string(),
@@ -926,7 +925,7 @@ mod tests {
         let cfg = DbConfig::default();
         crate::catalog::bootstrap::bootstrap(&dir.0, &cfg).unwrap();
         let catalog =
-            crate::catalog::loader::load_catalog(&dir.0, false, cfg.page_size).unwrap();
+            crate::catalog::loader::load_catalog(&dir.0, &cfg).unwrap();
         let cache = CatalogCache::new(catalog, cfg);
         let tsm = TablespaceManager::open(&dir.0, &cache).unwrap();
         (cache, tsm, dir)

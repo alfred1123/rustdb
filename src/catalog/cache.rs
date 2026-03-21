@@ -75,7 +75,7 @@ impl CatalogCache {
             cols.sort_by_key(|c| c.ordinal);
         }
 
-        let tables_data = Self::materialize_tables(&catalog);
+        let tables_data = Self::materialize_tables(&catalog, &config.sys_schema);
 
         // Pre-build column name vectors and name→index maps for every table.
         let column_meta: HashMap<(String, String), (Vec<String>, HashMap<String, usize>)> =
@@ -171,7 +171,7 @@ impl CatalogCache {
         self.catalog.schemas.push(schema);
         // Re-materialize SYSSCHEMAS.
         self.tables_data.insert(
-            (super::SYSTEM_SCHEMA.into(), "SYSSCHEMAS".into()),
+            (self.config.sys_schema.clone(), "SYSSCHEMAS".into()),
             Self::materialize_sysschemas(&self.catalog),
         );
     }
@@ -201,19 +201,19 @@ impl CatalogCache {
 
         // Re-materialize SYSTABLES and SYSCOLUMNS so SELECTs see them.
         self.tables_data.insert(
-            (super::SYSTEM_SCHEMA.into(), "SYSTABLES".into()),
+            (self.config.sys_schema.clone(), "SYSTABLES".into()),
             Self::materialize_systables(&self.catalog),
         );
         self.tables_data.insert(
-            (super::SYSTEM_SCHEMA.into(), "SYSCOLUMNS".into()),
+            (self.config.sys_schema.clone(), "SYSCOLUMNS".into()),
             Self::materialize_syscolumns(&self.catalog),
         );
     }
 
     // ── Internal: pre-materialize all catalog tables ──
 
-    fn materialize_tables(catalog: &Catalog) -> HashMap<(String, String), CachedTable> {
-        let schema = super::SYSTEM_SCHEMA.to_string();
+    fn materialize_tables(catalog: &Catalog, sys_schema: &str) -> HashMap<(String, String), CachedTable> {
+        let schema = sys_schema.to_string();
         let mut map = HashMap::new();
 
         // SYSTABLESPACES

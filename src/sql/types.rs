@@ -1,7 +1,7 @@
 use crate::error::Result;
 
 /// A single value in a result row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     SmallInt(i16),
     Integer(i32),

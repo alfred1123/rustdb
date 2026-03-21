@@ -1,23 +1,22 @@
 use std::fs;
 use std::path::Path;
 
+use crate::catalog::config::DbConfig;
 use crate::catalog::row::RowReader;
 use crate::catalog::types::*;
 use crate::error::{Error, Result};
 use crate::storage::heap::HeapFile;
 
-use super::SYSTEM_SCHEMA;
-
 /// Load the full system catalog from a database directory.
-pub fn load_catalog(data_dir: &Path, text_mode: bool, page_size: usize) -> Result<Catalog> {
+pub fn load_catalog(data_dir: &Path, config: &DbConfig) -> Result<Catalog> {
     log::debug!("loading catalog from {}", data_dir.display());
     let systbsp = data_dir.join("systbsp");
     let catalog = Catalog {
-        tablespaces: load_tablespaces(&systbsp, text_mode, page_size)?,
-        schemas: load_schemas(&systbsp, text_mode, page_size)?,
-        tables: load_tables(&systbsp, text_mode, page_size)?,
-        columns: load_columns(&systbsp, text_mode, page_size)?,
-        bufferpools: load_bufferpools(&systbsp, text_mode, page_size)?,
+        tablespaces: load_tablespaces(&systbsp, config)?,
+        schemas: load_schemas(&systbsp, config)?,
+        tables: load_tables(&systbsp, config)?,
+        columns: load_columns(&systbsp, config)?,
+        bufferpools: load_bufferpools(&systbsp, config)?,
     };
     log::info!(
         "catalog loaded: {} tablespaces, {} schemas, {} tables, {} columns, {} bufferpools",
@@ -32,18 +31,18 @@ pub fn load_catalog(data_dir: &Path, text_mode: bool, page_size: usize) -> Resul
 
 // ── Shared helpers ──
 
-fn read_binary_rows(dir: &Path, table: &str, page_size: usize) -> Result<Vec<Vec<u8>>> {
-    let path = dir.join(format!("{SYSTEM_SCHEMA}.{table}.0.DAT"));
+fn read_binary_rows(dir: &Path, table: &str, config: &DbConfig) -> Result<Vec<Vec<u8>>> {
+    let path = dir.join(format!("{}.{table}.0.DAT", config.sys_schema));
     if !path.exists() {
         return Err(Error::Catalog(format!("catalog file not found: {}", path.display())));
     }
-    let mut heap = HeapFile::open(&path, page_size)?;
+    let mut heap = HeapFile::open(&path, config.page_size)?;
     let rows = heap.scan()?;
     Ok(rows.into_iter().map(|(_, data)| data).collect())
 }
 
-fn read_text_rows(dir: &Path, table: &str) -> Result<Vec<Vec<String>>> {
-    let path = dir.join(format!("{SYSTEM_SCHEMA}.{table}.0.DAT"));
+fn read_text_rows(dir: &Path, table: &str, config: &DbConfig) -> Result<Vec<Vec<String>>> {
+    let path = dir.join(format!("{}.{table}.0.DAT", config.sys_schema));
     let content = fs::read_to_string(&path).map_err(|e| {
         Error::Catalog(format!("failed to read {}: {e}", path.display()))
     })?;
@@ -71,9 +70,9 @@ fn parse_i32(val: &str) -> Result<i32> {
 
 // ── Per-table loaders ──
 
-fn load_tablespaces(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Tablespace>> {
-    if text_mode {
-        read_text_rows(dir, "SYSTABLESPACES")?
+fn load_tablespaces(dir: &Path, config: &DbConfig) -> Result<Vec<Tablespace>> {
+    if config.text_mode {
+        read_text_rows(dir, "SYSTABLESPACES", config)?
             .iter()
             .map(|r| Ok(Tablespace {
                 tbspaceid: parse_i32(&col(r, 0, "SYSTABLESPACES")?)?,
@@ -86,7 +85,7 @@ fn load_tablespaces(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec
             }))
             .collect()
     } else {
-        read_binary_rows(dir, "SYSTABLESPACES", page_size)?
+        read_binary_rows(dir, "SYSTABLESPACES", config)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
@@ -104,14 +103,14 @@ fn load_tablespaces(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec
     }
 }
 
-fn load_schemas(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Schema>> {
-    if text_mode {
-        read_text_rows(dir, "SYSSCHEMAS")?
+fn load_schemas(dir: &Path, config: &DbConfig) -> Result<Vec<Schema>> {
+    if config.text_mode {
+        read_text_rows(dir, "SYSSCHEMAS", config)?
             .iter()
             .map(|r| Ok(Schema { name: col(r, 0, "SYSSCHEMAS")? }))
             .collect()
     } else {
-        read_binary_rows(dir, "SYSSCHEMAS", page_size)?
+        read_binary_rows(dir, "SYSSCHEMAS", config)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
@@ -121,9 +120,9 @@ fn load_schemas(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Sch
     }
 }
 
-fn load_tables(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Table>> {
-    if text_mode {
-        read_text_rows(dir, "SYSTABLES")?
+fn load_tables(dir: &Path, config: &DbConfig) -> Result<Vec<Table>> {
+    if config.text_mode {
+        read_text_rows(dir, "SYSTABLES", config)?
             .iter()
             .map(|r| Ok(Table {
                 name: col(r, 0, "SYSTABLES")?,
@@ -133,7 +132,7 @@ fn load_tables(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Tabl
             }))
             .collect()
     } else {
-        read_binary_rows(dir, "SYSTABLES", page_size)?
+        read_binary_rows(dir, "SYSTABLES", config)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
@@ -148,9 +147,9 @@ fn load_tables(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Tabl
     }
 }
 
-fn load_columns(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Column>> {
-    if text_mode {
-        read_text_rows(dir, "SYSCOLUMNS")?
+fn load_columns(dir: &Path, config: &DbConfig) -> Result<Vec<Column>> {
+    if config.text_mode {
+        read_text_rows(dir, "SYSCOLUMNS", config)?
             .iter()
             .map(|r| Ok(Column {
                 name: col(r, 0, "SYSCOLUMNS")?,
@@ -162,7 +161,7 @@ fn load_columns(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Col
             }))
             .collect()
     } else {
-        read_binary_rows(dir, "SYSCOLUMNS", page_size)?
+        read_binary_rows(dir, "SYSCOLUMNS", config)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
@@ -179,9 +178,9 @@ fn load_columns(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Col
     }
 }
 
-fn load_bufferpools(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<BufferPool>> {
-    if text_mode {
-        read_text_rows(dir, "SYSBUFFERPOOLS")?
+fn load_bufferpools(dir: &Path, config: &DbConfig) -> Result<Vec<BufferPool>> {
+    if config.text_mode {
+        read_text_rows(dir, "SYSBUFFERPOOLS", config)?
             .iter()
             .map(|r| Ok(BufferPool {
                 bpid: parse_i32(&col(r, 0, "SYSBUFFERPOOLS")?)?,
@@ -191,7 +190,7 @@ fn load_bufferpools(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec
             }))
             .collect()
     } else {
-        read_binary_rows(dir, "SYSBUFFERPOOLS", page_size)?
+        read_binary_rows(dir, "SYSBUFFERPOOLS", config)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
