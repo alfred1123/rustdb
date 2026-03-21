@@ -31,6 +31,8 @@ pub struct CatalogCache {
     schema_idx: HashMap<String, usize>,
     /// (SCHEMA, TABLE_NAME) → sorted columns for that table.
     columns_by_table: HashMap<(String, String), Vec<Column>>,
+    /// (SCHEMA, TABLE_NAME) → (column_names, column_name→index). Built once.
+    column_meta: HashMap<(String, String), (Vec<String>, HashMap<String, usize>)>,
 }
 
 impl CatalogCache {
@@ -72,6 +74,17 @@ impl CatalogCache {
 
         let tables_data = Self::materialize_tables(&catalog);
 
+        // Pre-build column name vectors and name→index maps for every table.
+        let column_meta: HashMap<(String, String), (Vec<String>, HashMap<String, usize>)> =
+            columns_by_table
+                .iter()
+                .map(|(key, cols)| {
+                    let names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+                    let index = Self::build_column_index(&names);
+                    (key.clone(), (names, index))
+                })
+                .collect();
+
         Self {
             catalog,
             tables_data,
@@ -79,6 +92,7 @@ impl CatalogCache {
             tablespace_by_id,
             schema_idx,
             columns_by_table,
+            column_meta,
         }
     }
 
@@ -101,6 +115,17 @@ impl CatalogCache {
         self.tablespace_by_id
             .get(&id)
             .map(|&i| &self.catalog.tablespaces[i])
+    }
+
+    /// O(1) lookup of precomputed column names and name→index map.
+    pub fn get_column_meta(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Option<(&[String], &HashMap<String, usize>)> {
+        self.column_meta
+            .get(&(schema.to_string(), table.to_string()))
+            .map(|(names, idx)| (names.as_slice(), idx))
     }
 
     /// O(1) pre-materialized table data for the executor.

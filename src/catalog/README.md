@@ -126,7 +126,8 @@ load_catalog()          CatalogCache::new(catalog)
    Vec<Tablespace>,       ├─ table_idx: HashMap         (schema,table) → index
    Vec<Schema>,           ├─ tablespace_by_id: HashMap  tbspaceid → index
    Vec<BufferPool>)       ├─ schema_idx: HashMap        schema name → index
-                          └─ columns_by_table: HashMap  (schema,table) → sorted cols
+                          ├─ columns_by_table: HashMap  (schema,table) → sorted cols
+                          └─ column_meta: HashMap       (schema,table) → (names, name→index)
 ```
 
 ### CachedTable
@@ -145,6 +146,7 @@ Each catalog table is pre-materialized into a `CachedTable`:
 |--------|---------|-----|
 | `get_table(schema, name)` | `Option<&Table>` | (schema, table) |
 | `get_columns(schema, table)` | `Option<&[Column]>` | (schema, table), sorted by ordinal |
+| `get_column_meta(schema, table)` | `Option<(&[String], &HashMap<String, usize>)>` | (schema, table) — precomputed column names + name→index map |
 | `get_tablespace_by_id(id)` | `Option<&Tablespace>` | tbspaceid |
 | `get_table_data(schema, table)` | `Option<&CachedTable>` | (schema, table) |
 

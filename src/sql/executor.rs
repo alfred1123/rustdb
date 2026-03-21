@@ -9,6 +9,7 @@ use crate::catalog::row::{RowReader, RowWriter};
 use crate::catalog::types::Column;
 use crate::error::{sql_error, Result, SqlState};
 use crate::sql::types::{ResultSet, TableRef, Value};
+use crate::storage::heap::Rid;
 use crate::storage::tablespace::TablespaceManager;
 
 /// Execute a parsed SQL statement against the storage engine.
@@ -21,6 +22,12 @@ pub fn execute(
         Statement::Query(query) => execute_query(query, cache, tsm),
         Statement::Insert(insert) => execute_insert(insert, cache, tsm),
         Statement::Delete(delete) => execute_delete(delete, cache, tsm),
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => execute_update(table, assignments, selection.as_ref(), cache, tsm),
         _ => Err(sql_error(
             SqlState::FeatureNotSupported,
             format!("unsupported statement: {stmt}"),
@@ -64,7 +71,14 @@ fn execute_query(
             )
         })?;
 
-    let meta = TableMeta::from_columns(columns);
+    let (column_names, column_index) = cache
+        .get_column_meta(&table_ref.schema, &table_ref.table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("table {}.{} not found", table_ref.schema, table_ref.table),
+            )
+        })?;
 
     // Scan rows from storage via tablespace manager.
     let raw_rows = tsm.table_scan(&table_ref.schema, &table_ref.table)?;
@@ -75,14 +89,14 @@ fn execute_query(
 
     // Resolve SELECT list using O(1) column index.
     let (selected_columns, selected_indices) =
-        resolve_select_list(&select.projection, &meta.column_names, &meta.column_index)?;
+        resolve_select_list(&select.projection, column_names, column_index)?;
 
     // Apply WHERE filter.
     let filtered_rows = match &select.selection {
         Some(expr) => {
             let mut result = Vec::new();
             for row in &all_rows {
-                if eval_where(expr, &meta.column_index, row)? {
+                if eval_where(expr, column_index, row)? {
                     result.push(row.clone());
                 }
             }
@@ -128,12 +142,19 @@ fn execute_insert(
     // Determine column ordering: explicit column list or table-order.
     let col_order = if !insert.columns.is_empty() {
         // Map provided column names to their ordinal positions.
-        let meta = TableMeta::from_columns(columns);
+        let (_, column_index) = cache
+            .get_column_meta(&table_ref.schema, &table_ref.table)
+            .ok_or_else(|| {
+                sql_error(
+                    SqlState::TableNotFound,
+                    format!("table {}.{} not found", table_ref.schema, table_ref.table),
+                )
+            })?;
         insert.columns
             .iter()
             .map(|ident| {
                 let name = ident.value.to_uppercase();
-                meta.column_index.get(&name).copied().ok_or_else(|| {
+                column_index.get(&name).copied().ok_or_else(|| {
                     sql_error(SqlState::ColumnNotFound, format!("column {name} not found"))
                 })
             })
@@ -216,7 +237,14 @@ fn execute_delete(
             )
         })?;
 
-    let meta = TableMeta::from_columns(columns);
+    let (_, column_index) = cache
+        .get_column_meta(&table_ref.schema, &table_ref.table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("table {}.{} not found", table_ref.schema, table_ref.table),
+            )
+        })?;
 
     // Scan all rows, evaluate WHERE, collect RIDs to delete.
     let raw_rows = tsm.table_scan(&table_ref.schema, &table_ref.table)?;
@@ -224,7 +252,7 @@ fn execute_delete(
     for (rid, bytes) in &raw_rows {
         let row = deserialize_row(bytes, columns)?;
         let matches = match &delete.selection {
-            Some(expr) => eval_where(expr, &meta.column_index, &row)?,
+            Some(expr) => eval_where(expr, column_index, &row)?,
             None => true, // DELETE without WHERE deletes all rows
         };
         if matches {
@@ -242,6 +270,94 @@ fn execute_delete(
     Ok(ResultSet {
         columns: vec!["ROWS_DELETED".into()],
         rows: vec![vec![Value::Integer(deleted)]],
+    })
+}
+
+// ── UPDATE ──
+
+fn execute_update(
+    table: &sqlparser::ast::TableWithJoins,
+    assignments: &[sqlparser::ast::Assignment],
+    selection: Option<&Expr>,
+    cache: &CatalogCache,
+    tsm: &mut TablespaceManager,
+) -> Result<ResultSet> {
+    let table_ref = resolve_table_factor(&table.relation)?;
+    log::debug!("UPDATE {}.{}", table_ref.schema, table_ref.table);
+
+    let columns = cache
+        .get_columns(&table_ref.schema, &table_ref.table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("table {}.{} not found", table_ref.schema, table_ref.table),
+            )
+        })?;
+
+    let (_, column_index) = cache
+        .get_column_meta(&table_ref.schema, &table_ref.table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("table {}.{} not found", table_ref.schema, table_ref.table),
+            )
+        })?;
+
+    // Resolve SET assignments to (column_index, expression) pairs.
+    let mut set_pairs: Vec<(usize, &Expr)> = Vec::with_capacity(assignments.len());
+    for assign in assignments {
+        let col_name = match &assign.target {
+            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                name.0.last()
+                    .map(|i| i.as_ident().unwrap().value.to_uppercase())
+                    .ok_or_else(|| sql_error(SqlState::SyntaxError, "empty column name in SET"))?
+            }
+            sqlparser::ast::AssignmentTarget::Tuple(_) => {
+                return Err(sql_error(
+                    SqlState::FeatureNotSupported,
+                    "tuple assignment in UPDATE is not supported",
+                ));
+            }
+        };
+        let idx = *column_index.get(&col_name).ok_or_else(|| {
+            sql_error(SqlState::ColumnNotFound, format!("column {col_name} not found"))
+        })?;
+        set_pairs.push((idx, &assign.value));
+    }
+
+    // Scan all rows, find matches, apply updates via delete+insert.
+    let raw_rows = tsm.table_scan(&table_ref.schema, &table_ref.table)?;
+    let mut updates: Vec<(Rid, Vec<u8>)> = Vec::new();
+
+    for (rid, bytes) in &raw_rows {
+        let row = deserialize_row(bytes, columns)?;
+        let matches = match selection {
+            Some(expr) => eval_where(expr, column_index, &row)?,
+            None => true,
+        };
+        if matches {
+            // Apply SET assignments: evaluate each expression against the
+            // current row so that `SET col = col + 1` style works (though
+            // arithmetic isn't wired up yet, literal values work now).
+            let mut new_row = row;
+            for &(col_idx, value_expr) in &set_pairs {
+                new_row[col_idx] = eval_expr(value_expr, column_index, &new_row)?;
+            }
+            let new_bytes = serialize_row(&new_row, columns)?;
+            updates.push((*rid, new_bytes));
+        }
+    }
+
+    let mut updated = 0i32;
+    for (rid, new_bytes) in updates {
+        tsm.delete_row(&table_ref.schema, &table_ref.table, rid)?;
+        tsm.insert_row(&table_ref.schema, &table_ref.table, &new_bytes)?;
+        updated += 1;
+    }
+
+    Ok(ResultSet {
+        columns: vec!["ROWS_UPDATED".into()],
+        rows: vec![vec![Value::Integer(updated)]],
     })
 }
 
@@ -271,27 +387,6 @@ fn resolve_table_name(name: &sqlparser::ast::ObjectName) -> Result<TableRef> {
 }
 
 // ── Generic row (de)serialization ──
-
-/// Column metadata extracted from catalog for the executor.
-struct TableMeta {
-    column_names: Vec<String>,
-    column_index: HashMap<String, usize>,
-}
-
-impl TableMeta {
-    fn from_columns(columns: &[Column]) -> Self {
-        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        let column_index: HashMap<String, usize> = column_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), i))
-            .collect();
-        Self {
-            column_names,
-            column_index,
-        }
-    }
-}
 
 /// Deserialize raw row bytes into Values using column type metadata.
 fn deserialize_row(bytes: &[u8], columns: &[Column]) -> Result<Vec<Value>> {
@@ -772,6 +867,116 @@ mod tests {
         assert_eq!(rs.rows[0][0].to_string(), "0");
     }
 
+    #[test]
+    fn update_with_where() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_where");
+
+        // SYSTBSP has tbspaceid=1. Update its tbspace name.
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET tbspace = 'RENAMED' WHERE tbspaceid = 1",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "1"); // 1 row updated
+
+        // Verify it was actually changed.
+        let stmts = parser::parse(
+            "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 1",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "RENAMED");
+    }
+
+    #[test]
+    fn update_all_rows() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_all");
+
+        // Update all tablespace states to 'Y'.
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET state = 'Y'",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "3"); // 3 rows updated
+
+        // Verify all rows have state = 'Y'.
+        let stmts = parser::parse(
+            "SELECT state FROM SYSTABLESPACES WHERE state = 'Y'",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 3);
+    }
+
+    #[test]
+    fn update_no_match() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_nomatch");
+
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET tbspace = 'X' WHERE tbspaceid = 99",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "0");
+    }
+
+    #[test]
+    fn update_multiple_columns() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_multi_col");
+
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET tbspace = 'NEW', tbspacetype = 'S' WHERE tbspaceid = 2",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "1");
+
+        let stmts = parser::parse(
+            "SELECT tbspace, tbspacetype FROM SYSTABLESPACES WHERE tbspaceid = 2",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "NEW");
+        assert_eq!(rs.rows[0][1].to_string(), "S");
+    }
+
+    #[test]
+    fn update_preserves_unmodified_rows() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_preserve");
+
+        // Update only tbspaceid=1, verify others unchanged.
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET tbspace = 'CHANGED' WHERE tbspaceid = 1",
+        )
+        .unwrap();
+        execute(&stmts[0], &cache, &mut tsm).unwrap();
+
+        // tbspaceid=2 should be unchanged.
+        let stmts = parser::parse(
+            "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 2",
+        )
+        .unwrap();
+        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "USERTBSP");
+    }
+
+    #[test]
+    fn update_column_not_found() {
+        let (cache, mut tsm, _dir) = test_fixture("upd_bad_col");
+        let stmts = parser::parse(
+            "UPDATE SYSTABLESPACES SET bogus = 'X' WHERE tbspaceid = 1",
+        )
+        .unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &cache, &mut tsm),
+            SqlState::ColumnNotFound,
+        );
+    }
+
     // ── Invalid SQL tests — verify SQLSTATE codes ──
 
     fn assert_sqlstate(result: Result<ResultSet>, expected: SqlState) {
@@ -819,10 +1024,10 @@ mod tests {
     }
 
     #[test]
-    fn error_unsupported_update() {
-        let (cache, mut tsm, _dir) = test_fixture("err_update");
+    fn error_unsupported_create_table() {
+        let (cache, mut tsm, _dir) = test_fixture("err_create");
         let stmts = parser::parse(
-            "UPDATE SYSTABLESPACES SET tbspace = 'X' WHERE tbspaceid = 1",
+            "CREATE TABLE foo (id INTEGER)",
         )
         .unwrap();
         assert_sqlstate(

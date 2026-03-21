@@ -130,6 +130,13 @@ cargo run -- --data-dir ./TESTDB
 - **Do not duplicate logic into separate functions for different modes** (e.g., text vs binary).
   Instead, branch within a single function so data definitions and field mappings exist in one place.
   Separate functions means changes must be made in two places, which leads to drift and bugs.
+- **Always use cached metadata from `CatalogCache` — never rebuild it.**
+  `CatalogCache` precomputes column names, column name→index maps, and tablespace
+  lookups at startup. Use `cache.get_column_meta(schema, table)` for column name/index
+  resolution and `cache.get_columns(schema, table)` for typed `Column` slices.
+  Never iterate `&[Column]` to build your own `HashMap<String, usize>` or `Vec<String>` —
+  this data is already cached. If you need metadata that isn't cached yet, add it to
+  `CatalogCache::new()` so all callers benefit from a single O(1) lookup.
 - **Update the relevant README when adding or changing features.**
   Each module directory (`src/catalog/`, `src/storage/`, `src/sql/`, etc.) and `TESTDB/`
   have their own `README.md`. When you add or change behavior in a module, update that
