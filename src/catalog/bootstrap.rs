@@ -88,21 +88,23 @@ fn write_sysschemas(dir: &Path, config: &DbConfig) -> Result<()> {
 }
 
 fn write_systables(dir: &Path, config: &DbConfig) -> Result<()> {
-    let tables: [(&str, i16); 5] = [
-        ("SYSTABLESPACES", 7i16),
-        ("SYSSCHEMAS", 1),
-        ("SYSTABLES", 4),
-        ("SYSCOLUMNS", 6),
-        ("SYSBUFFERPOOLS", 4),
+    // (tableid, name, colcount) — IDs assigned sequentially starting at 1.
+    let tables: [(i32, &str, i16); 5] = [
+        (1, "SYSTABLESPACES", 7i16),
+        (2, "SYSSCHEMAS", 1),
+        (3, "SYSTABLES", 5),
+        (4, "SYSCOLUMNS", 6),
+        (5, "SYSBUFFERPOOLS", 4),
     ];
 
     let text_rows: Vec<String> = tables.iter()
-        .map(|(name, cc)| format!("{name}\t{}\t1\t{cc}", config.sys_schema))
+        .map(|(id, name, cc)| format!("{id}\t{name}\t{}\t1\t{cc}", config.sys_schema))
         .collect();
 
     let binary_rows: Vec<Vec<u8>> = tables.iter()
-        .map(|(name, col_count)| {
+        .map(|(id, name, col_count)| {
             let mut w = RowWriter::new();
+            w.write_i32(*id);
             w.write_string(name);
             w.write_string(&config.sys_schema);
             w.write_i16(1);
@@ -111,7 +113,7 @@ fn write_systables(dir: &Path, config: &DbConfig) -> Result<()> {
         })
         .collect();
 
-    write_dat(dir, "SYSTABLES", "NAME\tSCHEMANAME\tTBSPACEID\tCOLCOUNT", &text_rows, &binary_rows, config)
+    write_dat(dir, "SYSTABLES", "TABLEID\tNAME\tSCHEMANAME\tTBSPACEID\tCOLCOUNT", &text_rows, &binary_rows, config)
 }
 
 fn write_syscolumns(dir: &Path, config: &DbConfig) -> Result<()> {
@@ -124,10 +126,11 @@ fn write_syscolumns(dir: &Path, config: &DbConfig) -> Result<()> {
         ("STATE", "SYSTABLESPACES", 5, "CHAR(1)", false),
         ("BUFFERPOOLID", "SYSTABLESPACES", 6, "INTEGER", false),
         ("NAME", "SYSSCHEMAS", 0, "VARCHAR(128)", false),
-        ("NAME", "SYSTABLES", 0, "VARCHAR(128)", false),
-        ("SCHEMANAME", "SYSTABLES", 1, "VARCHAR(128)", false),
-        ("TBSPACEID", "SYSTABLES", 2, "SMALLINT", false),
-        ("COLCOUNT", "SYSTABLES", 3, "SMALLINT", false),
+        ("TABLEID", "SYSTABLES", 0, "INTEGER", false),
+        ("NAME", "SYSTABLES", 1, "VARCHAR(128)", false),
+        ("SCHEMANAME", "SYSTABLES", 2, "VARCHAR(128)", false),
+        ("TBSPACEID", "SYSTABLES", 3, "SMALLINT", false),
+        ("COLCOUNT", "SYSTABLES", 4, "SMALLINT", false),
         ("NAME", "SYSCOLUMNS", 0, "VARCHAR(128)", false),
         ("TABNAME", "SYSCOLUMNS", 1, "VARCHAR(128)", false),
         ("SCHEMANAME", "SYSCOLUMNS", 2, "VARCHAR(128)", false),

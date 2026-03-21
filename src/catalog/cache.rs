@@ -75,7 +75,7 @@ impl CatalogCache {
             cols.sort_by_key(|c| c.ordinal);
         }
 
-        let tables_data = Self::materialize_tables(&catalog, &config.sys_schema);
+        let tables_data = Self::materialize_tables(&catalog, &config.sys_schema, &columns_by_table);
 
         // Pre-build column name vectors and name→index maps for every table.
         let column_meta: HashMap<(String, String), (Vec<String>, HashMap<String, usize>)> =
@@ -159,6 +159,17 @@ impl CatalogCache {
         &self.catalog
     }
 
+    /// Return the next available TABLEID (max existing + 1).
+    pub fn next_table_id(&self) -> i32 {
+        self.catalog
+            .tables
+            .iter()
+            .map(|t| t.tableid)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
     /// Check whether a schema exists.
     pub fn has_schema(&self, name: &str) -> bool {
         self.schema_idx.contains_key(name)
@@ -169,11 +180,7 @@ impl CatalogCache {
         let idx = self.catalog.schemas.len();
         self.schema_idx.insert(schema.name.clone(), idx);
         self.catalog.schemas.push(schema);
-        // Re-materialize SYSSCHEMAS.
-        self.tables_data.insert(
-            (self.config.sys_schema.clone(), "SYSSCHEMAS".into()),
-            Self::materialize_sysschemas(&self.catalog),
-        );
+        self.rematerialize("SYSSCHEMAS");
     }
 
     /// Register a newly-created table and its columns in the cache.
@@ -200,132 +207,92 @@ impl CatalogCache {
         self.catalog.columns.extend(columns);
 
         // Re-materialize SYSTABLES and SYSCOLUMNS so SELECTs see them.
-        self.tables_data.insert(
-            (self.config.sys_schema.clone(), "SYSTABLES".into()),
-            Self::materialize_systables(&self.catalog),
-        );
-        self.tables_data.insert(
-            (self.config.sys_schema.clone(), "SYSCOLUMNS".into()),
-            Self::materialize_syscolumns(&self.catalog),
-        );
+        self.rematerialize("SYSTABLES");
+        self.rematerialize("SYSCOLUMNS");
     }
 
-    // ── Internal: pre-materialize all catalog tables ──
+    // ── Internal: materialize catalog tables generically ──
 
-    fn materialize_tables(catalog: &Catalog, sys_schema: &str) -> HashMap<(String, String), CachedTable> {
-        let schema = sys_schema.to_string();
+    /// Build CachedTable entries for every table in the system schema.
+    /// Column names come from SYSCOLUMNS metadata (via `columns_by_table`),
+    /// not hardcoded lists. Row data comes from `catalog_rows` dispatch.
+    fn materialize_tables(
+        catalog: &Catalog,
+        sys_schema: &str,
+        columns_by_table: &HashMap<(String, String), Vec<Column>>,
+    ) -> HashMap<(String, String), CachedTable> {
         let mut map = HashMap::new();
-
-        // SYSTABLESPACES
-        map.insert(
-            (schema.clone(), "SYSTABLESPACES".into()),
-            Self::materialize_systablespaces(catalog),
-        );
-
-        // SYSSCHEMAS
-        map.insert(
-            (schema.clone(), "SYSSCHEMAS".into()),
-            Self::materialize_sysschemas(catalog),
-        );
-
-        // SYSTABLES
-        map.insert(
-            (schema.clone(), "SYSTABLES".into()),
-            Self::materialize_systables(catalog),
-        );
-
-        // SYSCOLUMNS
-        map.insert(
-            (schema.clone(), "SYSCOLUMNS".into()),
-            Self::materialize_syscolumns(catalog),
-        );
-
-        // SYSBUFFERPOOLS
-        map.insert(
-            (schema.clone(), "SYSBUFFERPOOLS".into()),
-            Self::materialize_sysbufferpools(catalog),
-        );
-
+        for table in &catalog.tables {
+            if table.schemaname == sys_schema {
+                let key = (sys_schema.to_string(), table.name.clone());
+                if let Some(cols) = columns_by_table.get(&key) {
+                    let column_names: Vec<String> = cols.iter().map(|c| c.name.clone()).collect();
+                    let column_index = Self::build_column_index(&column_names);
+                    let rows = Self::catalog_rows(catalog, &table.name);
+                    map.insert(key, CachedTable { column_names, column_index, rows });
+                }
+            }
+        }
         map
+    }
+
+    /// Re-materialize a single system catalog table after DDL mutations.
+    fn rematerialize(&mut self, table_name: &str) {
+        let key = (self.config.sys_schema.clone(), table_name.to_string());
+        let column_names: Vec<String> = match self.columns_by_table.get(&key) {
+            Some(cols) => cols.iter().map(|c| c.name.clone()).collect(),
+            None => return,
+        };
+        let column_index = Self::build_column_index(&column_names);
+        let rows = Self::catalog_rows(&self.catalog, table_name);
+        self.tables_data.insert(key, CachedTable { column_names, column_index, rows });
+    }
+
+    /// Convert catalog structs to Value rows for a given table name.
+    ///
+    /// Single dispatch point for struct → Value conversion.  When a new
+    /// system catalog table is added, add one match arm here.
+    fn catalog_rows(catalog: &Catalog, table_name: &str) -> Vec<Vec<Value>> {
+        match table_name {
+            "SYSTABLESPACES" => catalog.tablespaces.iter().map(|ts| vec![
+                Value::Integer(ts.tbspaceid),
+                Value::Str(ts.tbspace.clone()),
+                Value::Str(ts.tbspacetype.clone()),
+                Value::Str(ts.datatype.clone()),
+                Value::Integer(ts.pagesize),
+                Value::Str(ts.state.clone()),
+                Value::Integer(ts.bufferpoolid),
+            ]).collect(),
+            "SYSSCHEMAS" => catalog.schemas.iter().map(|s| vec![
+                Value::Str(s.name.clone()),
+            ]).collect(),
+            "SYSTABLES" => catalog.tables.iter().map(|t| vec![
+                Value::Integer(t.tableid),
+                Value::Str(t.name.clone()),
+                Value::Str(t.schemaname.clone()),
+                Value::SmallInt(t.tbspaceid),
+                Value::SmallInt(t.colcount),
+            ]).collect(),
+            "SYSCOLUMNS" => catalog.columns.iter().map(|c| vec![
+                Value::Str(c.name.clone()),
+                Value::Str(c.tabname.clone()),
+                Value::Str(c.schemaname.clone()),
+                Value::SmallInt(c.ordinal),
+                Value::Str(c.typename.clone()),
+                Value::Bool(c.nullable),
+            ]).collect(),
+            "SYSBUFFERPOOLS" => catalog.bufferpools.iter().map(|bp| vec![
+                Value::Integer(bp.bpid),
+                Value::Str(bp.bpname.clone()),
+                Value::Integer(bp.pagesize),
+                Value::Integer(bp.npages),
+            ]).collect(),
+            _ => vec![],
+        }
     }
 
     fn build_column_index(names: &[String]) -> HashMap<String, usize> {
         names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect()
-    }
-
-    fn materialize_systablespaces(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec![
-            "TBSPACEID".into(), "TBSPACE".into(), "TBSPACETYPE".into(),
-            "DATATYPE".into(), "PAGESIZE".into(), "STATE".into(),
-            "BUFFERPOOLID".into(),
-        ];
-        let rows = catalog.tablespaces.iter().map(|ts| vec![
-            Value::Integer(ts.tbspaceid),
-            Value::Str(ts.tbspace.clone()),
-            Value::Str(ts.tbspacetype.clone()),
-            Value::Str(ts.datatype.clone()),
-            Value::Integer(ts.pagesize),
-            Value::Str(ts.state.clone()),
-            Value::Integer(ts.bufferpoolid),
-        ]).collect();
-        let column_index = Self::build_column_index(&column_names);
-        CachedTable { column_names, column_index, rows }
-    }
-
-    fn materialize_sysschemas(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec!["NAME".into()];
-        let rows = catalog.schemas.iter().map(|s| vec![
-            Value::Str(s.name.clone()),
-        ]).collect();
-        let column_index = Self::build_column_index(&column_names);
-        CachedTable { column_names, column_index, rows }
-    }
-
-    fn materialize_systables(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec![
-            "NAME".into(), "SCHEMANAME".into(),
-            "TBSPACEID".into(), "COLCOUNT".into(),
-        ];
-        let rows = catalog.tables.iter().map(|t| vec![
-            Value::Str(t.name.clone()),
-            Value::Str(t.schemaname.clone()),
-            Value::SmallInt(t.tbspaceid),
-            Value::SmallInt(t.colcount),
-        ]).collect();
-        let column_index = Self::build_column_index(&column_names);
-        CachedTable { column_names, column_index, rows }
-    }
-
-    fn materialize_syscolumns(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec![
-            "NAME".into(), "TABNAME".into(), "SCHEMANAME".into(),
-            "ORDINAL".into(), "TYPENAME".into(), "NULLABLE".into(),
-        ];
-        let rows = catalog.columns.iter().map(|c| vec![
-            Value::Str(c.name.clone()),
-            Value::Str(c.tabname.clone()),
-            Value::Str(c.schemaname.clone()),
-            Value::SmallInt(c.ordinal),
-            Value::Str(c.typename.clone()),
-            Value::Bool(c.nullable),
-        ]).collect();
-        let column_index = Self::build_column_index(&column_names);
-        CachedTable { column_names, column_index, rows }
-    }
-
-    fn materialize_sysbufferpools(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec![
-            "BPID".into(), "BPNAME".into(),
-            "PAGESIZE".into(), "NPAGES".into(),
-        ];
-        let rows = catalog.bufferpools.iter().map(|bp| vec![
-            Value::Integer(bp.bpid),
-            Value::Str(bp.bpname.clone()),
-            Value::Integer(bp.pagesize),
-            Value::Integer(bp.npages),
-        ]).collect();
-        let column_index = Self::build_column_index(&column_names);
-        CachedTable { column_names, column_index, rows }
     }
 }
 
@@ -358,16 +325,18 @@ mod tests {
             schemas: vec![Schema { name: "RQSYS".into() }],
             tables: vec![
                 Table {
+                    tableid: 1,
                     name: "SYSTABLESPACES".into(),
                     schemaname: "RQSYS".into(),
                     tbspaceid: 1,
                     colcount: 7,
                 },
                 Table {
+                    tableid: 2,
                     name: "SYSTABLES".into(),
                     schemaname: "RQSYS".into(),
                     tbspaceid: 1,
-                    colcount: 4,
+                    colcount: 5,
                 },
             ],
             columns: vec![
@@ -388,11 +357,83 @@ mod tests {
                     nullable: false,
                 },
                 Column {
-                    name: "NAME".into(),
+                    name: "TBSPACETYPE".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 2,
+                    typename: "CHAR(1)".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "DATATYPE".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 3,
+                    typename: "CHAR(1)".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "PAGESIZE".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 4,
+                    typename: "INTEGER".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "STATE".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 5,
+                    typename: "CHAR(1)".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "BUFFERPOOLID".into(),
+                    tabname: "SYSTABLESPACES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 6,
+                    typename: "INTEGER".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "TABLEID".into(),
                     tabname: "SYSTABLES".into(),
                     schemaname: "RQSYS".into(),
                     ordinal: 0,
+                    typename: "INTEGER".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "NAME".into(),
+                    tabname: "SYSTABLES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 1,
                     typename: "VARCHAR(128)".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "SCHEMANAME".into(),
+                    tabname: "SYSTABLES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 2,
+                    typename: "VARCHAR(128)".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "TBSPACEID".into(),
+                    tabname: "SYSTABLES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 3,
+                    typename: "SMALLINT".into(),
+                    nullable: false,
+                },
+                Column {
+                    name: "COLCOUNT".into(),
+                    tabname: "SYSTABLES".into(),
+                    schemaname: "RQSYS".into(),
+                    ordinal: 4,
+                    typename: "SMALLINT".into(),
                     nullable: false,
                 },
             ],
@@ -430,9 +471,10 @@ mod tests {
     fn lookup_columns_sorted() {
         let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         let cols = cache.get_columns("RQSYS", "SYSTABLESPACES").unwrap();
-        assert_eq!(cols.len(), 2);
+        assert_eq!(cols.len(), 7);
         assert_eq!(cols[0].name, "TBSPACEID");
         assert_eq!(cols[1].name, "TBSPACE");
+        assert_eq!(cols[6].name, "BUFFERPOOLID");
         // Ordinals are in order.
         assert!(cols[0].ordinal < cols[1].ordinal);
     }

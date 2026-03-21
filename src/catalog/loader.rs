@@ -125,10 +125,11 @@ fn load_tables(dir: &Path, config: &DbConfig) -> Result<Vec<Table>> {
         read_text_rows(dir, "SYSTABLES", config)?
             .iter()
             .map(|r| Ok(Table {
-                name: col(r, 0, "SYSTABLES")?,
-                schemaname: col(r, 1, "SYSTABLES")?,
-                tbspaceid: parse_i16(&col(r, 2, "SYSTABLES")?)?,
-                colcount: parse_i16(&col(r, 3, "SYSTABLES")?)?,
+                tableid: parse_i32(&col(r, 0, "SYSTABLES")?)?,
+                name: col(r, 1, "SYSTABLES")?,
+                schemaname: col(r, 2, "SYSTABLES")?,
+                tbspaceid: parse_i16(&col(r, 3, "SYSTABLES")?)?,
+                colcount: parse_i16(&col(r, 4, "SYSTABLES")?)?,
             }))
             .collect()
     } else {
@@ -137,6 +138,7 @@ fn load_tables(dir: &Path, config: &DbConfig) -> Result<Vec<Table>> {
             .map(|row| {
                 let mut r = RowReader::new(row);
                 Ok(Table {
+                    tableid: r.read_i32()?,
                     name: r.read_string()?,
                     schemaname: r.read_string()?,
                     tbspaceid: r.read_i16()?,

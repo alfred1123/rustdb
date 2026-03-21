@@ -470,7 +470,9 @@ fn execute_create_table(
     }
 
     // 2. Insert a row into SYSTABLES.
+    let tableid = cache.next_table_id();
     let mut w = RowWriter::new();
+    w.write_i32(tableid);
     w.write_string(table_name);
     w.write_string(schema);
     w.write_i16(tbspaceid);
@@ -494,6 +496,7 @@ fn execute_create_table(
 
     // 5. Register in CatalogCache so subsequent queries see the table.
     let table = Table {
+        tableid,
         name: table_name.clone(),
         schemaname: schema.clone(),
         tbspaceid,

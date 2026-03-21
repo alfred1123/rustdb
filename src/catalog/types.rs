@@ -34,6 +34,7 @@ pub struct Schema {
 
 #[derive(Debug, Clone)]
 pub struct Table {
+    pub tableid: i32,
     pub name: String,
     pub schemaname: String,
     pub tbspaceid: i16,
