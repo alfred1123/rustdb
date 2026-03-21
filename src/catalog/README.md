@@ -6,8 +6,8 @@ System catalog module — manages the database's internal metadata.
 
 | File           | Purpose                                                    |
 |----------------|------------------------------------------------------------|
-| `mod.rs`       | Module root; exports `SYSTEM_SCHEMA` constant (`RQSYS`) for file-path / catalog-key construction |
-| `types.rs`     | Struct definitions: `Tablespace`, `Schema` (with `system` flag), `Table`, `Column`, `BufferPool`, `Catalog`; SQL type-system limits (`MIN_CHAR_LENGTH`, `MAX_CHAR_LENGTH`) |
+| `mod.rs`       | Module root; exports `SYSTEM_SCHEMA` constant (`RQSYS`)   |
+| `types.rs`     | Struct definitions: `Tablespace`, `Schema`, `Table`, `Column`, `BufferPool`, `Catalog`; SQL type-system limits (`MIN_CHAR_LENGTH`, `MAX_CHAR_LENGTH`) |
 | `row.rs`       | `RowReader` / `RowWriter` — binary serialization using u64 LE length-prefixed fields; row-format constants (`LENGTH_PREFIX_SIZE`, `MIN_COLUMN_BYTES`) |
 | `config.rs`    | `DbConfig` — reads/writes the `admin/SQLDBCONF` database configuration file |
 | `bootstrap.rs` | Creates a fresh database directory with `SQLDBCONF` and system catalog `.DAT` files |
@@ -74,17 +74,6 @@ Specifies what kind of data can be stored in the tablespace.
 |------|----------------|
 | `Y`  | Nullable       |
 | `N`  | Not nullable   |
-
-### SYSSCHEMAS.SYSTEMFLAG
-
-Flags whether a schema is a system schema. System schemas are protected
-from user DDL (e.g., `CREATE TABLE RQSYS.foo` is rejected) and are
-automatically appended to the search path after the default schema.
-
-| Code | Meaning        |
-|------|----------------|
-| `Y`  | System schema  |
-| `N`  | User schema    |
 
 ### SYSTABLESPACES.BUFFERPOOLID
 
@@ -165,8 +154,6 @@ Each catalog table is pre-materialized into a `CachedTable`:
 | `get_tablespace_by_id(id)` | `Option<&Tablespace>` | tbspaceid |
 | `get_table_data(schema, table)` | `Option<&CachedTable>` | (schema, table) |
 | `has_schema(name)` | `bool` | schema name |
-| `is_system_schema(name)` | `bool` | schema name — checks SYSTEMFLAG |
-| `system_schema_names()` | `Vec<&str>` | all schemas with SYSTEMFLAG='Y' |
 | `config()` | `&DbConfig` | Access SQLDBCONF parameters |
 | `default_tablespace_id()` | `i16` | Resolves `DFT_TBSP` config name to tablespace ID |
 | `register_schema(schema)` | `()` | Adds a new schema; re-materializes SYSSCHEMAS |

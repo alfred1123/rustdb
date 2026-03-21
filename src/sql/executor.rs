@@ -384,10 +384,10 @@ fn execute_create_table(
     // Reject creating tables in the system catalog schema (only when
     // explicitly schema-qualified, e.g., CREATE TABLE RQSYS.foo).
     let explicit_schema = create.name.0.len() > 1;
-    if explicit_schema && cache.is_system_schema(schema) {
+    if explicit_schema && schema == catalog::SYSTEM_SCHEMA {
         return Err(sql_error(
             SqlState::SystemSchemaViolation,
-            format!("cannot create user table in system schema {schema}"),
+            format!("cannot create user table in system schema {}", catalog::SYSTEM_SCHEMA),
         ));
     }
 
@@ -466,9 +466,8 @@ fn execute_create_table(
     if !cache.has_schema(schema) {
         let mut w = RowWriter::new();
         w.write_string(schema);
-        w.write_bool(false);
         tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSSCHEMAS", &w.finish())?;
-        cache.register_schema(Schema { name: schema.clone(), system: false });
+        cache.register_schema(Schema { name: schema.clone() });
     }
 
     // 2. Insert a row into SYSTABLES.
@@ -598,9 +597,7 @@ fn resolve_with_search_path(table_ref: TableRef, cache: &CatalogCache) -> TableR
     // Only search when the user didn't explicitly qualify.
     let default_schema = &cache.config().default_schema;
     if table_ref.schema == *default_schema {
-        let mut search_path = vec![default_schema.as_str()];
-        search_path.extend(cache.system_schema_names());
-        for sch in search_path {
+        for sch in [default_schema.as_str(), catalog::SYSTEM_SCHEMA] {
             if cache.get_table(sch, &table_ref.table).is_some() {
                 return TableRef {
                     schema: sch.to_string(),
@@ -1045,7 +1042,7 @@ mod tests {
         let (mut cache, mut tsm, _dir) = test_fixture("ins_cols");
 
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS (NAME, SYSTEMFLAG) VALUES ('USERSCH', 'N')",
+            "INSERT INTO SYSSCHEMAS (NAME) VALUES ('USERSCH')",
         )
         .unwrap();
         let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
@@ -1061,7 +1058,7 @@ mod tests {
         let (mut cache, mut tsm, _dir) = test_fixture("ins_multi");
 
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS VALUES ('S1', 'N'), ('S2', 'N'), ('S3', 'N')",
+            "INSERT INTO SYSSCHEMAS VALUES ('S1'), ('S2'), ('S3')",
         )
         .unwrap();
         let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
@@ -1530,9 +1527,9 @@ mod tests {
     #[test]
     fn error_not_null_violation() {
         let (mut cache, mut tsm, _dir) = test_fixture("err_null");
-        // SYSSCHEMAS has 2 columns (NAME VARCHAR, SYSTEMFLAG CHAR(1)). Insert NULL.
+        // SYSSCHEMAS has 1 column (NAME VARCHAR). Insert NULL.
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS VALUES (NULL, 'N')",
+            "INSERT INTO SYSSCHEMAS VALUES (NULL)",
         )
         .unwrap();
         assert_sqlstate(

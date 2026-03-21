@@ -30,8 +30,6 @@ pub struct Tablespace {
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
-    /// Whether this schema is a system schema (protected from DDL).
-    pub system: bool,
 }
 
 #[derive(Debug, Clone)]

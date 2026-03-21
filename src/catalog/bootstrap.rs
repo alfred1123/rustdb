@@ -80,27 +80,20 @@ fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result
 }
 
 fn write_sysschemas(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
-    // (name, system_flag)
-    let schemas: [(&str, bool); 2] = [
-        (SYSTEM_SCHEMA, true),
-        ("PUBLIC", false),
-    ];
-    let text_rows: Vec<String> = schemas.iter()
-        .map(|(s, sys)| format!("{s}\t{}", if *sys { "Y" } else { "N" }))
-        .collect();
-    let binary_rows: Vec<Vec<u8>> = schemas.iter().map(|(s, sys)| {
+    let schemas = [SYSTEM_SCHEMA, "PUBLIC"];
+    let text_rows: Vec<String> = schemas.iter().map(|s| s.to_string()).collect();
+    let binary_rows: Vec<Vec<u8>> = schemas.iter().map(|s| {
         let mut w = RowWriter::new();
         w.write_string(s);
-        w.write_bool(*sys);
         w.finish()
     }).collect();
-    write_dat(dir, "SYSSCHEMAS", "NAME\tSYSTEMFLAG", &text_rows, &binary_rows, text_mode, page_size)
+    write_dat(dir, "SYSSCHEMAS", "NAME", &text_rows, &binary_rows, text_mode, page_size)
 }
 
 fn write_systables(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let tables: [(&str, i16); 5] = [
         ("SYSTABLESPACES", 7i16),
-        ("SYSSCHEMAS", 2),
+        ("SYSSCHEMAS", 1),
         ("SYSTABLES", 4),
         ("SYSCOLUMNS", 6),
         ("SYSBUFFERPOOLS", 4),
@@ -134,7 +127,6 @@ fn write_syscolumns(dir: &Path, page_size: usize, text_mode: bool) -> Result<()>
         ("STATE", "SYSTABLESPACES", 5, "CHAR(1)", false),
         ("BUFFERPOOLID", "SYSTABLESPACES", 6, "INTEGER", false),
         ("NAME", "SYSSCHEMAS", 0, "VARCHAR(128)", false),
-        ("SYSTEMFLAG", "SYSSCHEMAS", 1, "CHAR(1)", false),
         ("NAME", "SYSTABLES", 0, "VARCHAR(128)", false),
         ("SCHEMANAME", "SYSTABLES", 1, "VARCHAR(128)", false),
         ("TBSPACEID", "SYSTABLES", 2, "SMALLINT", false),

@@ -49,7 +49,6 @@ SQL parser, planner, and executor.
 - Column count limit: dynamically derived from page size (max payload / `MIN_COLUMN_BYTES`).
   For a 4KB page this is 452 columns; for 8KB it's 907 (SQLSTATE 54011)
 - System schema protection: `CREATE TABLE RQSYS.<name>` is rejected (SQLSTATE 42508).
-  Any schema with `SYSTEMFLAG='Y'` in SYSSCHEMAS is protected.
   Unqualified names default to the configured default schema (`DFT_SCHEMA`) for DDL.
 
 ### Schema Resolution & Search Path
@@ -57,14 +56,13 @@ SQL parser, planner, and executor.
 - Unqualified table names default to the **configured default schema** (`DFT_SCHEMA`
   in `SQLDBCONF`, default: `PUBLIC`).
 - DML statements (SELECT, INSERT, UPDATE, DELETE) use a **search path**:
-  `[DFT_SCHEMA, <all system schemas>]`.  If the table isn't found in the default
-  schema, system schemas (those with `SYSTEMFLAG='Y'` in SYSSCHEMAS) are tried
-  automatically — so `SELECT * FROM SYSTABLES` still works without a schema prefix.
+  `[DFT_SCHEMA, RQSYS]`.  If the table isn't found in the default schema, RQSYS
+  is tried automatically — so `SELECT * FROM SYSTABLES` still works without a
+  schema prefix.
 - DDL (CREATE TABLE) does **not** search — it always creates in the resolved
   schema (default schema or the explicit schema if given).
-- System schemas are identified by the `SYSTEMFLAG` column in `RQSYS.SYSSCHEMAS`,
-  not by hardcoded name comparison. Any schema with `SYSTEMFLAG='Y'` is protected
-  from user DDL.
+- The RQSYS system catalog schema is protected: explicit `CREATE TABLE RQSYS.x`
+  is rejected.
 
 ### Configuration-Driven Constants
 
@@ -73,7 +71,7 @@ centralized in three places:
 
 | Constant | Location | Purpose |
 |----------|----------|---------|
-| `SYSTEM_SCHEMA` | `catalog/mod.rs` | System catalog schema name (`RQSYS`) — file-path / catalog-key use only |
+| `SYSTEM_SCHEMA` | `catalog/mod.rs` | System catalog schema name (`RQSYS`) |
 | `LENGTH_PREFIX_SIZE` | `catalog/row.rs` | Row wire-format overhead per field (8 bytes) |
 | `MIN_COLUMN_BYTES` | `catalog/row.rs` | Minimum serialized bytes per column (9) |
 | `MIN_CHAR_LENGTH` | `catalog/types.rs` | Minimum CHAR/VARCHAR length (1) |

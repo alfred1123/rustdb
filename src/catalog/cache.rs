@@ -164,24 +164,6 @@ impl CatalogCache {
         self.schema_idx.contains_key(name)
     }
 
-    /// Check whether a schema is a system schema (via SYSTEMFLAG).
-    pub fn is_system_schema(&self, name: &str) -> bool {
-        self.schema_idx
-            .get(name)
-            .map(|&i| self.catalog.schemas[i].system)
-            .unwrap_or(false)
-    }
-
-    /// Return the names of all system schemas (SYSTEMFLAG = 'Y').
-    pub fn system_schema_names(&self) -> Vec<&str> {
-        self.catalog
-            .schemas
-            .iter()
-            .filter(|s| s.system)
-            .map(|s| s.name.as_str())
-            .collect()
-    }
-
     /// Register a new schema in the cache (after persisting to SYSSCHEMAS).
     pub fn register_schema(&mut self, schema: Schema) {
         let idx = self.catalog.schemas.len();
@@ -291,10 +273,9 @@ impl CatalogCache {
     }
 
     fn materialize_sysschemas(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec!["NAME".into(), "SYSTEMFLAG".into()];
+        let column_names: Vec<String> = vec!["NAME".into()];
         let rows = catalog.schemas.iter().map(|s| vec![
             Value::Str(s.name.clone()),
-            Value::Bool(s.system),
         ]).collect();
         let column_index = Self::build_column_index(&column_names);
         CachedTable { column_names, column_index, rows }
@@ -374,7 +355,7 @@ mod tests {
                     bufferpoolid: 1,
                 },
             ],
-            schemas: vec![Schema { name: "RQSYS".into(), system: true }],
+            schemas: vec![Schema { name: "RQSYS".into() }],
             tables: vec![
                 Table {
                     name: "SYSTABLESPACES".into(),

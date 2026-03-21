@@ -108,20 +108,14 @@ fn load_schemas(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Sch
     if text_mode {
         read_text_rows(dir, "SYSSCHEMAS")?
             .iter()
-            .map(|r| Ok(Schema {
-                name: col(r, 0, "SYSSCHEMAS")?,
-                system: col(r, 1, "SYSSCHEMAS")? == "Y",
-            }))
+            .map(|r| Ok(Schema { name: col(r, 0, "SYSSCHEMAS")? }))
             .collect()
     } else {
         read_binary_rows(dir, "SYSSCHEMAS", page_size)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
-                Ok(Schema {
-                    name: r.read_string()?,
-                    system: r.read_bool()?,
-                })
+                Ok(Schema { name: r.read_string()? })
             })
             .collect()
     }
