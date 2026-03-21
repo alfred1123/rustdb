@@ -156,7 +156,9 @@ Each catalog table is pre-materialized into a `CachedTable`:
 | `get_table_data(schema, table)` | `Option<&CachedTable>` | (schema, table) |
 | `has_schema(name)` | `bool` | schema name |
 | `config()` | `&DbConfig` | Access SQLDBCONF parameters |
+| `catalog()` | `&Catalog` | Direct access to underlying typed catalog |
 | `default_tablespace_id()` | `i16` | Resolves `DFT_TBSP` config name to tablespace ID |
+| `next_table_id()` | `i32` | Next available table ID (max existing + 1) |
 | `register_schema(schema)` | `()` | Adds a new schema; re-materializes SYSSCHEMAS |
 | `register_table(table, columns)` | `()` | Adds a new table + columns; re-materializes SYSTABLES/SYSCOLUMNS |
 

@@ -4,8 +4,9 @@ A transactional relational database engine written from scratch in Rust,
 following IBM DB2-style catalog and tablespace conventions and ANSI SQL
 standards.
 
-**Status:** Storage engine complete. SQL reads work. Writes, transactions,
-and networking are in progress.
+**Status:** Storage engine and full CRUD SQL are complete. CREATE TABLE, INSERT,
+UPDATE, DELETE, and SELECT all work with WHERE filtering. Data persists across
+restarts. Transactions and networking are in progress.
 
 ## Why RustDB?
 
@@ -29,8 +30,12 @@ and networking are in progress.
   buffer overflows, no data races. Zero `unsafe` blocks in the codebase.
 - **Zero external runtime dependencies.** No JVM, no garbage collector, no
   language runtime. Single static binary, starts in milliseconds.
-- **Interactive SQL REPL** with `SELECT`, `WHERE` filtering, column
-  projection, and schema-prefixed table references.
+- **Full CRUD SQL.** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and
+  `CREATE TABLE` — all with `WHERE` filtering, column projection, and
+  schema-prefixed table references.
+- **Data persistence.** All data is flushed to `.DAT` heap files on
+  shutdown and reloaded on startup — user tables survive restarts.
+- **Interactive SQL REPL** with immediate feedback and SQLSTATE error codes.
 
 ### Comparison with Other Databases
 
@@ -44,7 +49,7 @@ and networking are in progress.
 | **Buffer pool** | Named pools, per-tablespace routing | Single page cache | `shared_buffers` | Memory-mapped |
 | **Deployment** | Single binary, no runtime | Single file, no runtime | Server + client + extensions | Single library |
 | **Concurrency** | Single-session (multi-session planned) | File-level locking / WAL mode | Full MVCC | Single-writer |
-| **SQL coverage** | SELECT, INSERT, DELETE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
+| **SQL coverage** | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
 | **Transactions** | Planned (ARIES-style WAL) | WAL or journal | WAL + MVCC | WAL |
 | **Codebase size** | ~3K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
@@ -65,8 +70,7 @@ and networking are in progress.
 - **Production workloads.** No WAL, no crash recovery, no transactions yet.
 - **Multi-user access.** Single-session only — no TCP server or connection
   pooling.
-- **Complex queries.** No JOINs, aggregations, subqueries, or INSERT/UPDATE/
-  DELETE in the SQL layer yet.
+- **Complex queries.** No JOINs, aggregations, or subqueries yet.
 - **Large datasets.** Not benchmarked at scale. No indexes beyond sequential
   scan.
 
@@ -78,7 +82,7 @@ and networking are in progress.
 │          (main.rs — interactive shell)       │
 ├──────────────────────────────────────────────┤
 │               SQL Layer                      │
-│   Parser (sqlparser) → Executor (SELECT)     │
+│   Parser (sqlparser) → Executor (CRUD+DDL)   │
 ├──────────────────────────────────────────────┤
 │            Catalog Cache                     │
 │   O(1) HashMap lookups, pre-materialized     │
@@ -107,7 +111,7 @@ rustdb/
 │   ├── error.rs              # Error types (thiserror)
 │   ├── catalog/              # System catalog, bootstrap, loader, cache
 │   ├── storage/              # Slotted pages, heap files, FSM, buffer pool, tablespace manager
-│   ├── sql/                  # SQL parser + executor
+│   ├── sql/                  # SQL parser + executor (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE)
 │   ├── transaction/          # WAL, concurrency, recovery (planned)
 │   └── server/               # TCP listener, wire protocol (planned)
 ├── data/TESTDB/              # Default database instance directory
@@ -121,7 +125,7 @@ rustdb/
 # Build
 cargo build
 
-# Run tests (84 tests)
+# Run tests (126 tests)
 cargo test
 
 # Bootstrap and start with a new database
@@ -137,23 +141,35 @@ cargo run -- --data-dir ./data/DEBUGDB --text-mode
 RUST_LOG=debug cargo run -- --data-dir ./data/MYDB
 ```
 
-### Sample Queries
+### Sample Session
 
 ```sql
--- All tables in the database
+-- Create a table
+CREATE TABLE employees (id INTEGER NOT NULL, name VARCHAR(50), dept VARCHAR(30))
+
+-- Insert rows
+INSERT INTO employees VALUES (1, 'Alice', 'Engineering')
+INSERT INTO employees VALUES (2, 'Bob', 'Marketing'), (3, 'Carol', 'Engineering')
+
+-- Query with filtering
+SELECT name, dept FROM employees WHERE dept = 'Engineering'
+
+-- Update rows
+UPDATE employees SET dept = 'Sales' WHERE id = 2
+
+-- Delete rows
+DELETE FROM employees WHERE id = 3
+
+-- Schema-qualified tables
+CREATE TABLE myapp.products (sku INTEGER NOT NULL, label VARCHAR(80))
+INSERT INTO myapp.products VALUES (100, 'Widget')
+SELECT * FROM myapp.products
+
+-- Inspect the system catalog
 SELECT * FROM RQSYS.SYSTABLES
-
--- Column definitions for a specific table
-SELECT NAME, TYPENAME, NULLABLE FROM RQSYS.SYSCOLUMNS WHERE TABNAME = 'SYSTABLESPACES'
-
--- Tablespace configuration
+SELECT NAME, TYPENAME, NULLABLE FROM RQSYS.SYSCOLUMNS WHERE TABNAME = 'EMPLOYEES'
 SELECT TBSPACE, PAGESIZE, TBSPACETYPE FROM RQSYS.SYSTABLESPACES
-
--- Buffer pool configuration
 SELECT * FROM RQSYS.SYSBUFFERPOOLS
-
--- Filter by integer column
-SELECT TBSPACE, PAGESIZE FROM RQSYS.SYSTABLESPACES WHERE TBSPACEID = 1
 ```
 
 ## System Catalog
@@ -185,7 +201,8 @@ Within each row, fields are encoded as length-prefixed values:
 ```
 
 Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
-(variable UTF-8), `CHAR(n)` (fixed UTF-8), `DOUBLE` (8B LE).
+(variable UTF-8), `CHAR(n)` (fixed UTF-8), `DOUBLE` (8B LE), `TIMESTAMP`
+(33B UTF-8).
 
 ## Dependencies
 
@@ -210,8 +227,11 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 - [x] In-memory catalog cache with O(1) lookups
 - [x] SQL REPL with SELECT + WHERE
 - [x] INSERT / DELETE in SQL executor (via TablespaceManager)
-- [ ] UPDATE in SQL executor
-- [ ] CREATE TABLE / DROP TABLE (DDL)
+- [x] UPDATE in SQL executor (in-place with row migration)
+- [x] CREATE TABLE (DDL) with auto-schema creation and catalog registration
+- [x] Data persistence across restart (flush + reload)
+- [x] SQLSTATE error codes for all SQL errors
+- [ ] DROP TABLE (DDL)
 - [ ] Write-ahead log (WAL) with ARIES-style recovery
 - [ ] MVCC or lock-based concurrency control
 - [ ] B-tree indexes

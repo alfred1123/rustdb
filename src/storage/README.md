@@ -959,19 +959,18 @@ single-session, low-concurrency stage. The `VecDeque` implementation is easy
 to reason about and test. Upgrading to CLOCK is the natural first step when
 profiling shows `retain()` overhead or scan pollution becomes measurable.
 
-### Free-Space Tracking: In-Memory `Vec<u16>` vs On-Disk Bitmaps
+### Free-Space Tracking: Binary Max-Heap FSM vs On-Disk Bitmaps
 
 | | Current | Alternative (Oracle ASSM-style) |
 |---|---|---|
-| **Design** | In-memory `Vec<u16>` tracking actual free bytes per page + `next_free_hint` | On-disk bitmap blocks with graduated fullness levels (0–25%, 25–50%, etc.) |
-| **Pro** | Skips too-full pages without disk reads; near-O(1) inserts via hint | Survives crash; scales to millions of pages; low insert contention |
-| **Con** | Lost on crash (rebuilt optimistically on reopen) | Bitmap blocks consume space; L1/L2/L3 tree adds implementation cost |
+| **Design** | Binary max-heap FSM with 1-byte categories per page; persisted to `.FSM` files on flush | On-disk bitmap blocks with graduated fullness levels (0–25%, 25–50%, etc.) |
+| **Pro** | O(log P) search; crash-durable via `.FSM` persistence; no linear scans | Scales to millions of pages; low insert contention with L1/L2/L3 tree |
+| **Con** | Entire FSM loaded into memory; category granularity (~16 bytes per step at 4KB pages) | Bitmap blocks consume space; L1/L2/L3 tree adds implementation cost |
 
 **Potential upgrade (incremental):**
-1. **Near-term:** Persist the free map as a header page (page 0) in each
-   `.DAT` file — gives crash durability without full ASSM complexity.
-2. **Medium-term:** Upgrade to a 2-bit-per-page encoding
-   (empty / <50% / <75% / full) to reduce wasted probes on insert.
+1. **Near-term:** Finer category granularity for large page sizes.
+2. **Medium-term:** Lazy FSM loading — only load subtrees for active
+   tablespaces instead of the full heap.
 3. **Long-term:** Full bitmap tree (ASSM-style) when page counts reach
    hundreds of thousands.
 
@@ -1017,7 +1016,7 @@ read consistency without abandoning the single-log model.
 | Area | Current approach | Complexity | Performance ceiling |
 |------|-----------------|------------|-------------------|
 | Buffer pools | Named, per-tablespace | Low | Medium (manual tuning) |
-| Free-space map | In-memory `Vec<u16>` + hint | Low | Medium (skips full pages without I/O, lost on crash) |
+| Free-space map | Binary max-heap FSM, persisted to `.FSM` | Low | High (O(log P) search, crash-durable) |
 | Deletes | Tombstone | Low | Medium (needs compaction) |
 | Row addressing | `RID(page, slot)` | Low | Sufficient for single-file tables |
 | Recovery | ARIES WAL | Medium | High (proven at scale) |

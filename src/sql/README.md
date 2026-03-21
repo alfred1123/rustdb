@@ -367,21 +367,18 @@ With a B-tree index on a WHERE column:
 | UPDATE WHERE col = X | O(N) | O(log N) |
 | SELECT WHERE col = X | O(N) | O(log N) |
 
-#### 2. In-place UPDATE (avoid delete + insert)
+#### 2. In-place UPDATE ✅ (completed)
 
-Current UPDATE deletes the old row and inserts a new one, which:
-- Writes twice to the page layer (one delete, one insert)
-- May relocate the row to a different page
-- Would invalidate any index pointers (once indexes exist)
+DB2-style in-place row overwrite is fully implemented:
+- `page.update_row(slot, new_data)` overwrites the row directly when the new data fits
+- Automatic fallback to row migration (delete + insert on a different page) when the row outgrows its slot
+- FSM is updated after both in-place and migration paths
+- The executor calls `tsm.update_row()` which handles both cases transparently
 
-Industry approach:
-- **DB2/InnoDB:** Overwrite the row in place if it fits in the same slot
-- **PostgreSQL HOT:** Write a new tuple version on the same page, avoid index update if indexed columns didn't change
-
-Requires:
-- [ ] `page.update_row(slot, new_data)` — in-place overwrite when new data fits
-- [ ] Fallback to delete+insert when new row is larger than old slot
-- [ ] FSM update after in-place modification
+Implemented:
+- [x] `page.update_row(slot, new_data)` — in-place overwrite when new data fits
+- [x] Fallback to delete+insert when new row is larger than old slot
+- [x] FSM update after in-place modification
 
 #### 3. Query Planner / Optimizer
 
