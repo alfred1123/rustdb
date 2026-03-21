@@ -155,6 +155,7 @@ circular dependency.
 | `insert_row` | `(&mut self, &[u8]) -> Option<SlotIndex>` | Insert row, `None` if page full |
 | `read_row` | `(&self, SlotIndex) -> Option<&[u8]>` | Read row bytes, `None` if deleted/OOB |
 | `delete_row` | `(&mut self, SlotIndex) -> bool` | Tombstone a slot, `false` if already gone |
+| `update_row` | `(&mut self, SlotIndex, &[u8]) -> UpdateResult` | In-place overwrite if fits; see below |
 | `free_space` | `(&self) -> usize` | Usable bytes remaining (accounts for new slot entry) |
 | `as_bytes` | `(&self) -> &[u8]` | Raw buffer for writing to disk |
 | `into_bytes` | `(self) -> Vec<u8>` | Consume and return buffer |
@@ -164,6 +165,72 @@ circular dependency.
 - Header correctness, insert/read, multi-row insert, delete, slot reuse,
   overflow rejection, fill-until-full, byte roundtrip, checksum corruption
   detection, out-of-range slot access.
+
+### In-Place Update (DB2-Style) ✅
+
+The page layer supports **DB2-style in-place row overwrite** via
+`update_row(slot, new_data)`. This replaces the old delete-then-insert
+strategy used by the executor and avoids unnecessary row relocation.
+
+**Strategy:**
+
+```
+┌──────────────────────────────────────────────────┐
+│ UPDATE row at slot S with new_data               │
+│                                                  │
+│ Case 1: new_len ≤ old_len (row fits in place)    │
+│   → Overwrite old row bytes directly             │
+│   → Update slot length (may leave dead space)    │
+│   → No slot directory changes needed             │
+│   → No free-space pointer change needed          │
+│                                                  │
+│ Case 2: new_len > old_len AND free space enough  │
+│   → Zero old slot (tombstone)                    │
+│   → Allocate new space from free region          │
+│   → Point slot to new location                   │
+│   → Same slot index preserved (RID stable)       │
+│                                                  │
+│ Case 3: new_len > old_len AND not enough space   │
+│   → Return NotEnoughSpace                        │
+│   → Caller does delete + insert (row migration)  │
+│   → New RID assigned on different page            │
+└──────────────────────────────────────────────────┘
+```
+
+**Return type:**
+
+```rust
+pub enum UpdateResult {
+    /// Row updated in place. Same slot, same page. RID unchanged.
+    Updated,
+    /// Slot not found or already deleted.
+    NotFound,
+    /// New row is too large for this page. Caller must do delete+insert
+    /// on a different page (row migration).
+    NotEnoughSpace,
+}
+```
+
+**Why this matters:**
+- **RID stability:** In-place update preserves the RID, which is critical
+  once indexes exist — no index update needed if the row stays on the same
+  page and slot.
+- **Single write:** One page write instead of two (delete page + insert page).
+- **No FSM churn:** The row stays on its page, so the FSM entry doesn't
+  need to be updated for a different page.
+- **Undo log friendly:** The WAL only needs a before-image of the row
+  bytes (not a full delete+insert log record pair).
+
+**Comparison with previous approach:**
+
+| Aspect | Old (delete+insert) | New (in-place) |
+|--------|---------------------|----------------|
+| Page writes | 2 (delete page, insert page) | 1 |
+| RID changes | Yes (new page, new slot) | No (same slot) |
+| Index updates needed | All indexes | None (if same page) |
+| FSM updates | 2 (old page freed, new page used) | 0–1 |
+| WAL records | 2 (delete + insert) | 1 (update with before-image) |
+| Fallback | N/A | Row migration when row grows beyond page capacity |
 
 ---
 
@@ -571,6 +638,7 @@ SQL Executor / Catalog
 | `insert_row` | `(&mut self, schema, table, &[u8]) -> Result<Rid>` | Insert row, return RID |
 | `read_row` | `(&mut self, schema, table, Rid) -> Result<Vec<u8>>` | Read one row by RID |
 | `delete_row` | `(&mut self, schema, table, Rid) -> Result<bool>` | Tombstone a row |
+| `update_row` | `(&mut self, schema, table, Rid, &[u8]) -> Result<UpdateRowResult>` | In-place update or row migration |
 | `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages in all pools + persist FSMs |
 | `pool_manager` | `(&self) -> &BufferPoolManager` | Read-only access for diagnostics |
 
@@ -591,6 +659,51 @@ tracks per-page free space as 1-byte categories.
 The FSM eliminates both the O(N) linear scan and the need for a best-seen
 hint tracker. Each search is O(log P) with no page reads for rejected
 candidates.
+
+### Update Flow (In-Place, DB2-Style)
+
+The tablespace manager's `update_row()` attempts an **in-place overwrite**
+on the same page via the page-level `update_row()`. If the row has grown
+beyond the page's available space, it falls back to delete + insert on a
+different page (**row migration**).
+
+```
+update_row(schema, table, rid, new_bytes)
+  │
+  ├─ Resolve (schema, table) → (pool_id, file_id, FSM)
+  │
+  ├─ fetch_page_mut(file_id, rid.page_id)     ── exclusive latch
+  │
+  ├─ page.update_row(rid.slot, new_bytes)
+  │    │
+  │    ├─ Updated → unpin dirty, update FSM, return InPlace
+  │    │             (same RID — no index update needed)
+  │    │
+  │    └─ NotEnoughSpace → unpin, fall back:
+  │         ├─ fetch_page_mut again, delete_row(rid.slot)
+  │         ├─ unpin dirty, update FSM
+  │         ├─ insert_row(schema, table, new_bytes)
+  │         │    └─ standard FSM-based insert on any page
+  │         └─ return Migrated(new_rid)
+  │
+  └─ NotFound → return error (row already deleted)
+```
+
+**Return type at tablespace level:**
+
+```rust
+pub enum UpdateRowResult {
+    /// Updated in place — same RID, same page.
+    InPlace,
+    /// Row migrated to a new page — new RID returned.
+    /// Caller must update any indexes pointing to the old RID.
+    Migrated(Rid),
+}
+```
+
+**Performance:**
+- Best case (row same size or smaller): 1 page fetch + 1 write = O(1)
+- Worst case (row migration): 1 delete + 1 FSM search + 1 insert = O(log P)
 
 ### Scan Flow
 
@@ -643,6 +756,8 @@ pre-materialized `CachedTable` rows:
 - **SELECT:** `table_scan()` → generic `deserialize_row()` using column
   metadata from `CatalogCache.get_columns()`
 - **INSERT:** `serialize_row()` → `insert_row()` via TSM
+- **UPDATE:** `table_scan()` + WHERE filter → in-place `update_row()` by
+  RID with automatic row migration fallback when the row outgrows its slot
 - **DELETE:** `table_scan()` + WHERE filter → `delete_row()` by RID
 
 This makes SELECT, INSERT, and DELETE work against any table — catalog or

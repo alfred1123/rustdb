@@ -39,7 +39,10 @@ SQL parser, planner, and executor.
 - `UPDATE <table> SET col = value WHERE condition` — conditional update
 - `UPDATE <table> SET c1 = v1, c2 = v2 ...` — update multiple columns
 - SET expressions can reference columns (`SET col = other_col`) or use literals
-- Uses delete-then-insert strategy (no in-place update) to reuse existing storage paths
+- Uses **DB2-style in-place update**: overwrites the row directly in its
+  existing page slot. If the row grows beyond the page's free space, falls
+  back to row migration (delete + insert on a different page).
+  Before-images are preserved in the WAL for rollback, not on the data page.
 
 ## Data Path
 
@@ -56,13 +59,30 @@ so the executor never rebuilds them per query.
         metadata     │      │  data I/O
                      ▼      ▼
               CatalogCache  TablespaceManager
-              ├─ get_columns()       └──▶ BufferPool ──▶ Disk
-              └─ get_column_meta()
+              ├─ get_columns()       ├──▶ BufferPool ──▶ Disk
+              └─ get_column_meta()   └──▶ WAL (planned)
 ```
 
 Row deserialization is generic: column typename drives which `RowReader`
 method is called (SMALLINT→read_i16, INTEGER→read_i32, CHAR/VARCHAR→read_string).
 INSERT and UPDATE serialization works the same way in reverse via `RowWriter`.
+
+### UPDATE Data Flow
+
+```
+execute_update()
+  ├─ table_scan() → collect all rows
+  ├─ eval_where() → filter matching rows
+  ├─ per matched row:
+  │    ├─ apply SET assignments → build new_bytes
+  │    ├─ [WAL: log_update(old_bytes, new_bytes)]   (planned)
+  │    └─ tsm.update_row(rid, new_bytes)
+  │         ├─ page.update_row(slot, new_bytes)
+  │         │    ├─ fits → in-place overwrite (same RID)
+  │         │    └─ doesn't fit → row migration (new RID)
+  │         └─ update FSM if needed
+  └─ return ROWS_UPDATED count
+```
 
 ## Planned
 
@@ -131,50 +151,55 @@ Errors follow the ANSI SQL SQLSTATE convention (5-character codes):
 | N | Total rows in the table |
 | P | Total pages in the heap file |
 | S | Slots per page |
-| C | Number of columns in the table |
 | K | Number of SET assignments (UPDATE only) |
 | M | Number of rows matched by WHERE |
 
-### INSERT — O(C + log P) per row
+Column count (C) is omitted — it is a schema constant fixed at table
+creation time, not a data-dependent variable. Per-column work like
+serialize/deserialize is O(1) for any given table.
+
+### INSERT — O(log P) per row
 
 **Call chain:**
 
 ```
 execute_insert()
   ├─ cache.get_columns()            O(1)   — HashMap lookup
-  ├─ column ordering loop           O(C)
+  ├─ cache.get_column_meta()        O(1)   — precomputed name→index map
   └─ per row in VALUES:
-      ├─ eval_literal() × C         O(C)
-      ├─ serialize_row()            O(C)   — RowWriter iterates columns
+      ├─ eval_literal() per value   O(1) each — literal evaluation
+      ├─ serialize_row()            O(1)*  — RowWriter iterates columns (constant per schema)
       └─ tsm.insert_row()
           ├─ fsm.search(needed)     O(log P) — binary max-heap descent
-          ├─ pool.fetch_page_mut()  O(1)*  — buffer pool hash lookup
+          ├─ pool.fetch_page_mut()  O(1)**  — buffer pool hash lookup
           ├─ page.insert_row()      O(S)   — scan slot directory
           ├─ pool.unpin()           O(1)
           └─ fsm.update()           O(log P) — sift-up in binary heap
 ```
 
-\* O(1) amortized; worst-case O(P) on eviction + flush.
+\* Column count C is fixed per table schema — treated as a constant.
+
+\*\* O(1) amortized; worst-case O(P) on eviction + flush.
 
 If no page qualifies: `pool.new_page()` O(1) append + `fsm.extend()` O(1) amortized.
 
-**Total per row: O(C + log P)**
+**Total per row: O(log P)**
 
-### DELETE — O(N·C + M·log P)
+### DELETE — O(N + M·log P)
 
 **Call chain:**
 
 ```
 execute_delete()
   ├─ cache.get_columns()             O(1)
-  ├─ TableMeta::from_columns()       O(C)   — builds HashMap
+  ├─ cache.get_column_meta()         O(1)   — precomputed name→index map
   ├─ tsm.table_scan()               O(N)   — full heap scan
   │    └─ per page (P pages):
   │        ├─ pool.fetch_page()      O(1)*
   │        ├─ read all S slots       O(S)
   │        └─ pool.unpin()           O(1)
   ├─ per scanned row (N rows):
-  │    ├─ deserialize_row()          O(C)   — RowReader per column
+  │    ├─ deserialize_row()          O(1)** — RowReader per column (constant per schema)
   │    └─ eval_where()               O(1)   — HashMap column lookup + comparison
   └─ per matched row (M rows):
        └─ tsm.delete_row()
@@ -184,38 +209,54 @@ execute_delete()
             └─ fsm.update()          O(log P)
 ```
 
-**Total: O(N·C + M·log P)**
+\* O(1) amortized; worst-case O(P) on eviction + flush.
 
-### UPDATE — O(N·C + M·(C + log P))
+\*\* Column count C is fixed per table schema — treated as a constant.
 
-**Call chain:**
+**Total: O(N + M·log P)**
+
+### UPDATE — O(N) best case, O(N + M·log P) worst case
+
+**Call chain (with in-place update):**
 
 ```
 execute_update()
   ├─ cache.get_columns()             O(1)
-  ├─ TableMeta::from_columns()       O(C)
+  ├─ cache.get_column_meta()         O(1)   — precomputed name→index map
   ├─ resolve SET assignments         O(K)   — HashMap lookups
   ├─ tsm.table_scan()               O(N)   — full heap scan
   ├─ per scanned row (N rows):
-  │    ├─ deserialize_row()          O(C)
+  │    ├─ deserialize_row()          O(1)*  — constant per schema
   │    ├─ eval_where()               O(1)
   │    └─ if matched:
   │         ├─ eval_expr() × K       O(K)   — apply SET assignments
-  │         └─ serialize_row()       O(C)
+  │         └─ serialize_row()       O(1)*  — constant per schema
   └─ per matched row (M rows):
-       ├─ tsm.delete_row()          O(1 + log P) — same as DELETE
-       └─ tsm.insert_row()          O(C + log P) — same as INSERT
+       └─ tsm.update_row()
+            ├─ Best case: page.update_row() fits → O(1) in-place overwrite
+            └─ Worst case: row migration → O(log P) delete + FSM insert
 ```
 
-**Total: O(N·C + M·(C + log P))**
+\* Column count C is fixed per table schema — treated as a constant.
+
+**Best case (row same size or shrinks): O(N)** — scan + M in-place overwrites.
+**Worst case (all rows migrate): O(N + M·log P)** — same as before.
+
+In practice, most UPDATEs don't change row size (e.g., updating a status
+flag, changing a fixed-size integer). The in-place path dominates.
 
 ### Summary
 
 | Operation | Complexity | Dominant Cost |
 |-----------|------------|---------------|
-| INSERT (1 row) | O(C + log P) | FSM search + serialize |
-| DELETE (with WHERE) | O(N·C + M·log P) | Full table scan |
-| UPDATE (with WHERE) | O(N·C + M·(C + log P)) | Full table scan + re-serialize |
+| INSERT (1 row) | O(log P) | FSM page search |
+| DELETE (with WHERE) | O(N + M·log P) | Full table scan |
+| UPDATE (best: in-place) | O(N) | Full table scan + in-place overwrite |
+| UPDATE (worst: migration) | O(N + M·log P) | Full table scan + row migration |
+
+Column count C is a schema constant and not included in the complexity
+expressions. Serialize/deserialize cost is proportional to C but fixed
+for any given table.
 
 ### Comparison with Industry-Standard Databases
 
@@ -225,22 +266,22 @@ Below is a side-by-side comparison:
 
 | Aspect | RustDB (current) | Industry Standard (PostgreSQL, DB2, etc.) |
 |--------|-------------------|-------------------------------------------|
-| **SELECT with WHERE** | O(N·C) — full table scan, no indexes | O(log N) with B-tree index; O(1) with hash index |
-| **INSERT** | O(C + log P) — FSM-based page search | O(C + log N) per index — similar base cost, but each index adds O(log N) for key insertion |
-| **DELETE with WHERE** | O(N·C + M·log P) — full scan to find rows | O(log N + M·log N) with index — scan avoidance is the key win |
-| **UPDATE with WHERE** | O(N·C + M·(C + log P)) — full scan + delete/insert | O(log N + M) with index + HOT (heap-only tuple) in-place update |
-| **UPDATE strategy** | Delete old row + insert new row | In-place update (DB2/InnoDB) or HOT update (PostgreSQL) — avoids rewriting indexes |
+| **SELECT with WHERE** | O(N) — full table scan, no indexes | O(log N) with B-tree index; O(1) with hash index |
+| **INSERT** | O(log P) — FSM-based page search | O(log N) per index — similar base cost, but each index adds O(log N) for key insertion |
+| **DELETE with WHERE** | O(N + M·log P) — full scan to find rows | O(log N + M·log N) with index — scan avoidance is the key win |
+| **UPDATE with WHERE** | O(N) best / O(N + M·log P) worst — in-place overwrite with row migration fallback | O(log N + M) with index + HOT (heap-only tuple) in-place update |
+| **UPDATE strategy** | DB2-style in-place overwrite; row migration when row outgrows page | In-place update (DB2/InnoDB) or HOT update (PostgreSQL) — avoids rewriting indexes |
 | **Concurrency** | Single-threaded, page-level latches | MVCC with row-level locks; thousands of concurrent transactions |
 | **Query planning** | None — direct execution | Cost-based optimizer choosing between seq scan, index scan, bitmap scan, etc. |
 | **WHERE evaluation** | Scans all rows, then filters | Pushes predicates into index lookups; only touches qualifying rows |
 | **JOIN support** | None | Nested loop, hash join, merge join, with cost-based selection |
-| **Write-ahead log** | WAL infrastructure exists but not wired to DML | Full WAL-logged DML; crash recovery replays log to restore consistency |
+| **Write-ahead log** | WAL infrastructure designed; DB2-style undo/redo model planned | Full WAL-logged DML; crash recovery replays log to restore consistency |
 | **Buffer pool** | LRU eviction with FSM | Clock-sweep (PostgreSQL) or LRU variants with adaptive prefetching |
 
-**The critical gap is the O(N) full table scan for DELETE/UPDATE.** Industry
-databases solve this with B-tree indexes that reduce row lookup from O(N) to
-O(log N). Without indexes, every DELETE and UPDATE must read every row in the
-table regardless of how selective the WHERE clause is.
+**The critical gap is the O(N) full table scan for SELECT/DELETE/UPDATE.**
+Industry databases solve this with B-tree indexes that reduce row lookup
+from O(N) to O(log N). Without indexes, every query with a WHERE clause
+must read every row in the table regardless of how selective the predicate is.
 
 ### Development Required to Reach Industry Standard
 
@@ -261,9 +302,9 @@ With a B-tree index on a WHERE column:
 
 | Operation | Current | With B-tree Index |
 |-----------|---------|-------------------|
-| DELETE WHERE col = X | O(N·C) | O(log N + C) |
-| UPDATE WHERE col = X | O(N·C) | O(log N + C) |
-| SELECT WHERE col = X | O(N·C) | O(log N + C) |
+| DELETE WHERE col = X | O(N) | O(log N) |
+| UPDATE WHERE col = X | O(N) | O(log N) |
+| SELECT WHERE col = X | O(N) | O(log N) |
 
 #### 2. In-place UPDATE (avoid delete + insert)
 
@@ -342,7 +383,7 @@ To be usable as a general-purpose SQL engine:
 | 2. Catalog | Self-describing system catalog | ✅ Complete |
 | 3. Basic DML | SELECT, INSERT, UPDATE, DELETE on single tables | ✅ Complete |
 | 4. Indexes | B-tree or hash indexes for O(log N) lookups | ❌ Not started |
-| 5. WAL-logged DML | Crash-safe mutations via write-ahead log | ❌ Infrastructure only |
+| 5. WAL-logged DML | Crash-safe mutations via write-ahead log | ⏳ Design complete, implementation planned |
 | 6. Query planner | Cost-based optimizer with multiple access paths | ❌ Not started |
 | 7. Transactions | ACID transactions with MVCC concurrency | ❌ Not started |
 | 8. DDL | CREATE/DROP/ALTER TABLE, CREATE INDEX | ❌ Not started |

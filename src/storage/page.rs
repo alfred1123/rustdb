@@ -110,6 +110,75 @@ fn delete_row_from(buf: &mut [u8], slot: SlotIndex) -> bool {
     true
 }
 
+/// Result of an in-place update attempt on a slotted page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateResult {
+    /// Row updated in place — same slot, same page.
+    Updated,
+    /// Slot not found or already deleted.
+    NotFound,
+    /// New row is too large for this page. Caller must do delete+insert
+    /// on a different page (row migration).
+    NotEnoughSpace,
+}
+
+/// Attempt to update a row in place (DB2-style).
+///
+/// - If `new_data` fits in the existing slot (same or smaller), overwrite directly.
+/// - If `new_data` is larger but the page has enough free space, tombstone the
+///   old slot, allocate new space from the free region, and repoint the slot.
+/// - If the page doesn't have enough space, return `NotEnoughSpace`.
+fn update_row_in(buf: &mut [u8], slot: SlotIndex, new_data: &[u8]) -> UpdateResult {
+    if slot >= slot_count_of(buf) {
+        return UpdateResult::NotFound;
+    }
+    let (old_off, old_len) = slot_of(buf, slot);
+    if old_off == 0 && old_len == 0 {
+        return UpdateResult::NotFound; // deleted
+    }
+
+    let new_len = new_data.len();
+    let old_len_usize = old_len as usize;
+
+    if new_len <= old_len_usize {
+        // Case 1: new data fits in existing slot — overwrite in place.
+        let start = old_off as usize;
+        buf[start..start + new_len].copy_from_slice(new_data);
+        // Update slot length (may be shorter — leaves dead bytes, but slot is accurate).
+        let slot_off = PAGE_HEADER_SIZE + (slot as usize) * SLOT_SIZE;
+        put_u16(buf, slot_off + 2, new_len as u16);
+        update_checksum_of(buf);
+        UpdateResult::Updated
+    } else {
+        // Case 2: new data is larger — check if page has enough free space.
+        // We get back the old slot's space implicitly since we'll tombstone it,
+        // but free_space_of() doesn't account for the old slot since it's still live.
+        // Effective free = current free + old row bytes (which we'll reclaim).
+        let effective_free = free_space_of(buf) + old_len_usize;
+        if effective_free < new_len {
+            return UpdateResult::NotEnoughSpace;
+        }
+
+        // Tombstone old slot (frees it for accounting but doesn't compact).
+        let slot_entry_off = PAGE_HEADER_SIZE + (slot as usize) * SLOT_SIZE;
+        put_u16(buf, slot_entry_off, 0);
+        put_u16(buf, slot_entry_off + 2, 0);
+
+        // Allocate new space from the free region (grows from end).
+        let data_start = get_u16(buf, FREE_SPACE_OFF) as usize;
+        let new_data_start = data_start - new_len;
+        buf[new_data_start..new_data_start + new_len].copy_from_slice(new_data);
+        put_u16(buf, FREE_SPACE_OFF, new_data_start as u16);
+
+        // Repoint the same slot to the new location.
+        put_u16(buf, slot_entry_off, new_data_start as u16);
+        put_u16(buf, slot_entry_off + 2, new_len as u16);
+
+        update_checksum_of(buf);
+        UpdateResult::Updated
+    }
+}
+
 /// Initialize a raw buffer as an empty data page with the given page_id.
 pub(crate) fn init_page_buf(buf: &mut [u8], page_id: PageId) {
     buf.fill(0);
@@ -193,6 +262,10 @@ pub trait PageWrite: PageRead {
 
     fn delete_row(&mut self, slot: SlotIndex) -> bool {
         delete_row_from(self.buf_mut(), slot)
+    }
+
+    fn update_row(&mut self, slot: SlotIndex, new_data: &[u8]) -> UpdateResult {
+        update_row_in(self.buf_mut(), slot, new_data)
     }
 }
 
@@ -434,5 +507,83 @@ mod tests {
         let p = SlottedPage::new(0, TEST_PAGE_SIZE);
         assert_eq!(p.read_row(0), None);
         assert_eq!(p.read_row(99), None);
+    }
+
+    // ── update_row tests ──
+
+    #[test]
+    fn update_row_same_size() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s = p.insert_row(b"hello").unwrap();
+        assert_eq!(p.update_row(s, b"world"), UpdateResult::Updated);
+        assert_eq!(p.read_row(s), Some(b"world".as_slice()));
+    }
+
+    #[test]
+    fn update_row_smaller() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s = p.insert_row(b"long data here").unwrap();
+        assert_eq!(p.update_row(s, b"short"), UpdateResult::Updated);
+        assert_eq!(p.read_row(s), Some(b"short".as_slice()));
+    }
+
+    #[test]
+    fn update_row_larger_with_space() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s = p.insert_row(b"tiny").unwrap();
+        assert_eq!(
+            p.update_row(s, b"a much longer replacement row"),
+            UpdateResult::Updated
+        );
+        assert_eq!(
+            p.read_row(s),
+            Some(b"a much longer replacement row".as_slice())
+        );
+        // Slot index is preserved.
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn update_row_not_enough_space() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s = p.insert_row(b"small").unwrap();
+        // Fill page nearly full.
+        let big = vec![0xABu8; TEST_PAGE_SIZE / 2];
+        let _ = p.insert_row(&big);
+        let _ = p.insert_row(&big);
+        // Try to update the small row to something huge.
+        let huge = vec![0xFFu8; TEST_PAGE_SIZE];
+        assert_eq!(p.update_row(s, &huge), UpdateResult::NotEnoughSpace);
+        // Original row should still be intact (was tombstoned only if we entered case 2).
+        // Actually with NotEnoughSpace in case 2 path, we return before tombstoning.
+        // Let's verify the row is still readable.
+        assert_eq!(p.read_row(s), Some(b"small".as_slice()));
+    }
+
+    #[test]
+    fn update_row_deleted_returns_not_found() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s = p.insert_row(b"doomed").unwrap();
+        p.delete_row(s);
+        assert_eq!(p.update_row(s, b"nope"), UpdateResult::NotFound);
+    }
+
+    #[test]
+    fn update_row_out_of_range_returns_not_found() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        assert_eq!(p.update_row(99, b"nope"), UpdateResult::NotFound);
+    }
+
+    #[test]
+    fn update_row_preserves_other_rows() {
+        let mut p = SlottedPage::new(0, TEST_PAGE_SIZE);
+        let s0 = p.insert_row(b"row-0").unwrap();
+        let s1 = p.insert_row(b"row-1").unwrap();
+        let s2 = p.insert_row(b"row-2").unwrap();
+        // Update only row-1.
+        assert_eq!(p.update_row(s1, b"UPDATED"), UpdateResult::Updated);
+        assert_eq!(p.read_row(s0), Some(b"row-0".as_slice()));
+        assert_eq!(p.read_row(s1), Some(b"UPDATED".as_slice()));
+        assert_eq!(p.read_row(s2), Some(b"row-2".as_slice()));
     }
 }

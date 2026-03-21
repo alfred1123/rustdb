@@ -350,8 +350,7 @@ fn execute_update(
 
     let mut updated = 0i32;
     for (rid, new_bytes) in updates {
-        tsm.delete_row(&table_ref.schema, &table_ref.table, rid)?;
-        tsm.insert_row(&table_ref.schema, &table_ref.table, &new_bytes)?;
+        tsm.update_row(&table_ref.schema, &table_ref.table, rid, &new_bytes)?;
         updated += 1;
     }
 

@@ -5,7 +5,7 @@ use crate::catalog::cache::CatalogCache;
 use crate::error::{Error, Result};
 use crate::storage::fsm::FreeSpaceMap;
 use crate::storage::heap::Rid;
-use crate::storage::page::{PageRead, PageWrite};
+use crate::storage::page::{PageRead, PageWrite, UpdateResult};
 use crate::storage::pool::{BufferPoolId, BufferPoolManager, FileId};
 
 /// Routing info for one table's data file.
@@ -16,6 +16,15 @@ struct TableFileInfo {
     fsm: FreeSpaceMap,
     /// Path to the `.FSM` file for persistence.
     fsm_path: PathBuf,
+}
+
+/// Result of an in-place update attempt via the tablespace manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateRowResult {
+    /// Updated in place — same RID, same page.
+    InPlace,
+    /// Row migrated to a new page — new RID returned.
+    Migrated(Rid),
 }
 
 /// Central coordinator mapping (schema, table) to heap files and routing all
@@ -283,6 +292,67 @@ impl TablespaceManager {
         info.fsm.update(rid.page_id as usize, actual_free);
 
         Ok(deleted)
+    }
+
+    /// Update a row in place (DB2-style). If the new data fits on the same
+    /// page, the row is overwritten and the RID is preserved. If it doesn't
+    /// fit, the old row is deleted and the new data is inserted on another
+    /// page (row migration) — a new RID is returned.
+    pub fn update_row(
+        &mut self,
+        schema: &str,
+        table: &str,
+        rid: Rid,
+        new_data: &[u8],
+    ) -> Result<UpdateRowResult> {
+        let key = (schema.to_string(), table.to_string());
+        let info = self.table_files.get(&key).ok_or_else(|| {
+            Error::Catalog(format!(
+                "table {schema}.{table} not registered in tablespace manager"
+            ))
+        })?;
+        let pool_id = info.pool_id;
+        let file_id = info.file_id;
+
+        // Attempt in-place update.
+        let pool = self.pool_manager.get_mut(pool_id)?;
+        let result: UpdateResult;
+        let actual_free: usize;
+        {
+            let mut page = pool.fetch_page_mut(file_id, rid.page_id)?;
+            result = page.update_row(rid.slot, new_data);
+            actual_free = page.free_space();
+        }
+
+        match result {
+            UpdateResult::Updated => {
+                let pool = self.pool_manager.get_mut(pool_id)?;
+                pool.unpin(file_id, rid.page_id, true)?;
+                let info = self.table_files.get_mut(&key).unwrap();
+                info.fsm.update(rid.page_id as usize, actual_free);
+                Ok(UpdateRowResult::InPlace)
+            }
+            UpdateResult::NotFound => {
+                let pool = self.pool_manager.get_mut(pool_id)?;
+                pool.unpin(file_id, rid.page_id, false)?;
+                Err(Error::Corruption(format!(
+                    "row not found at page={}, slot={} for update",
+                    rid.page_id, rid.slot
+                )))
+            }
+            UpdateResult::NotEnoughSpace => {
+                // Row migration: delete from current page, insert on any page.
+                let pool = self.pool_manager.get_mut(pool_id)?;
+                pool.unpin(file_id, rid.page_id, false)?;
+
+                // Delete old row.
+                self.delete_row(schema, table, rid)?;
+
+                // Insert new row on best-fit page.
+                let new_rid = self.insert_row(schema, table, new_data)?;
+                Ok(UpdateRowResult::Migrated(new_rid))
+            }
+        }
     }
 
     /// Flush all dirty pages across all buffer pools and persist FSMs.
