@@ -296,8 +296,9 @@ impl BufferPool {
             .ok_or_else(|| Error::Catalog(format!("file_id {file_id} not registered")))
     }
 
-    /// Evict all pages belonging to a file from the pool, flush dirty ones
-    /// first, then remove the file registration entirely.
+    /// Evict all pages belonging to a file from the pool and remove the
+    /// file registration. Dirty pages are **discarded** (not flushed) — the
+    /// caller is expected to be deleting the file (e.g., DROP TABLE).
     pub fn evict_file(&mut self, file_id: FileId) -> Result<()> {
         let frame_indices: Vec<FrameIndex> = self.page_table.iter()
             .filter(|&(&(fid, _), _)| fid == file_id)
@@ -305,9 +306,6 @@ impl BufferPool {
             .collect();
 
         for idx in &frame_indices {
-            if self.frame_meta[*idx].dirty {
-                self.flush_frame(*idx)?;
-            }
             let key = (self.frame_meta[*idx].file_id, self.frame_meta[*idx].page_id);
             self.page_table.remove(&key);
             self.lru.retain(|&i| i != *idx);

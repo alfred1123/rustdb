@@ -54,7 +54,7 @@ restarts. Transactions and networking are in progress.
 | **Concurrency** | Single-session (multi-session planned) | File-level locking / WAL mode | Full MVCC | Single-writer |
 | **SQL coverage** | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
 | **Transactions** | Planned (ARIES-style WAL) | WAL or journal | WAL + MVCC | WAL |
-| **Codebase size** | ~3K lines | ~150K lines | ~1.5M lines | ~300K lines |
+| **Codebase size** | ~7K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
 ### When to Consider RQDB
 
@@ -285,7 +285,7 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 - [x] Data persistence across restart (flush + reload)
 - [x] SQLSTATE error codes for all SQL errors
 - [x] CONNECT TO / CREATE DATABASE / DISCONNECT (safe database management)
-- [ ] DROP TABLE (DDL)
+- [x] DROP TABLE (DDL)
 - [ ] Write-ahead log (WAL) with ARIES-style recovery
 - [ ] MVCC or lock-based concurrency control
 - [ ] B-tree indexes

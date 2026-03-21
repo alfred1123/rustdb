@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    ColumnOption, Expr, SelectItem, SetExpr, Statement, TableFactor,
+    ColumnOption, Expr, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
 
 use crate::catalog::cache::CatalogCache;
@@ -32,6 +32,12 @@ pub fn execute(
         Statement::CreateTable(create_table) => {
             execute_create_table(create_table, cache, tsm)
         }
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            if_exists,
+            ..
+        } => execute_drop_table(names, *if_exists, cache, tsm),
         _ => Err(sql_error(
             SqlState::FeatureNotSupported,
             format!("unsupported statement: {stmt}"),
@@ -508,6 +514,133 @@ fn execute_create_table(
         columns: vec!["STATUS".into()],
         rows: vec![vec![Value::Str(format!("TABLE {schema}.{table_name} CREATED"))]],
     })
+}
+
+// ── DROP TABLE ──
+
+fn execute_drop_table(
+    names: &[sqlparser::ast::ObjectName],
+    if_exists: bool,
+    cache: &mut CatalogCache,
+    tsm: &mut TablespaceManager,
+) -> Result<ResultSet> {
+    if names.len() != 1 {
+        return Err(sql_error(
+            SqlState::FeatureNotSupported,
+            "DROP TABLE supports exactly one table at a time",
+        ));
+    }
+
+    let table_ref = resolve_table_name(&names[0], cache)?;
+    let table_ref = resolve_with_search_path(table_ref, cache);
+    let schema = &table_ref.schema;
+    let table_name = &table_ref.table;
+    log::debug!("DROP TABLE {schema}.{table_name}");
+
+    let sys_schema = cache.config().sys_schema.clone();
+
+    // Reject dropping system catalog tables.
+    if *schema == sys_schema {
+        return Err(sql_error(
+            SqlState::SystemSchemaViolation,
+            format!("cannot drop system table {schema}.{table_name}"),
+        ));
+    }
+
+    // Check existence.
+    if cache.get_table(schema, table_name).is_none() {
+        if if_exists {
+            return Ok(ResultSet {
+                columns: vec!["STATUS".into()],
+                rows: vec![vec![Value::Str(format!(
+                    "TABLE {schema}.{table_name} DOES NOT EXIST (skipped)"
+                ))]],
+            });
+        }
+        return Err(sql_error(
+            SqlState::TableNotFound,
+            format!("table {schema}.{table_name} not found"),
+        ));
+    }
+
+    // 1. Delete the matching row from SYSTABLES.
+    delete_catalog_rows_for_table(
+        &sys_schema, "SYSTABLES", schema, table_name, cache, tsm,
+    )?;
+
+    // 2. Delete matching rows from SYSCOLUMNS.
+    delete_catalog_rows_for_table(
+        &sys_schema, "SYSCOLUMNS", schema, table_name, cache, tsm,
+    )?;
+
+    // 3. Drop the heap file and FSM from disk + evict from buffer pool.
+    tsm.drop_table(schema, table_name)?;
+
+    // 4. Unregister from the in-memory catalog cache.
+    cache.unregister_table(schema, table_name);
+
+    Ok(ResultSet {
+        columns: vec!["STATUS".into()],
+        rows: vec![vec![Value::Str(format!("TABLE {schema}.{table_name} DROPPED"))]],
+    })
+}
+
+/// Delete rows in a system catalog table that reference the given
+/// `(schema, table)`. For SYSTABLES, matches on SCHEMANAME + NAME columns.
+/// For SYSCOLUMNS, matches on SCHEMANAME + TABNAME columns.
+fn delete_catalog_rows_for_table(
+    sys_schema: &str,
+    catalog_table: &str,
+    target_schema: &str,
+    target_table: &str,
+    cache: &CatalogCache,
+    tsm: &mut TablespaceManager,
+) -> Result<()> {
+    let columns = cache
+        .get_columns(sys_schema, catalog_table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("catalog table {sys_schema}.{catalog_table} not found"),
+            )
+        })?;
+
+    let (_, column_index) = cache
+        .get_column_meta(sys_schema, catalog_table)
+        .ok_or_else(|| {
+            sql_error(
+                SqlState::TableNotFound,
+                format!("catalog table {sys_schema}.{catalog_table} not found"),
+            )
+        })?;
+
+    let schema_col = if catalog_table == "SYSTABLES" { "SCHEMANAME" } else { "SCHEMANAME" };
+    let name_col = if catalog_table == "SYSTABLES" { "NAME" } else { "TABNAME" };
+
+    let schema_idx = *column_index.get(schema_col).ok_or_else(|| {
+        sql_error(SqlState::ColumnNotFound, format!("column {schema_col} not found in {catalog_table}"))
+    })?;
+    let name_idx = *column_index.get(name_col).ok_or_else(|| {
+        sql_error(SqlState::ColumnNotFound, format!("column {name_col} not found in {catalog_table}"))
+    })?;
+
+    let raw_rows = tsm.table_scan(sys_schema, catalog_table)?;
+    let mut rids_to_delete = Vec::new();
+
+    for (rid, bytes) in &raw_rows {
+        let row = deserialize_row(bytes, columns)?;
+        let row_schema = row[schema_idx].to_string();
+        let row_name = row[name_idx].to_string();
+        if row_schema == target_schema && row_name == target_table {
+            rids_to_delete.push(*rid);
+        }
+    }
+
+    for rid in rids_to_delete {
+        tsm.delete_row(sys_schema, catalog_table, rid)?;
+    }
+
+    Ok(())
 }
 
 /// Compute the maximum serialized row size (in bytes) for a set of columns.
@@ -1551,6 +1684,145 @@ mod tests {
         assert_sqlstate(
             execute(&stmts[0], &mut cache, &mut tsm),
             SqlState::AssignmentError,
+        );
+    }
+
+    // ── DROP TABLE tests ──
+
+    #[test]
+    fn drop_table_basic() {
+        let (mut cache, mut tsm, dir) = test_fixture("dt_basic");
+
+        // Create and populate a table.
+        for sql in [
+            "CREATE TABLE things (id INTEGER NOT NULL, name VARCHAR(30))",
+            "INSERT INTO things VALUES (1, 'alpha')",
+            "INSERT INTO things VALUES (2, 'beta')",
+        ] {
+            let stmts = parser::parse(sql).unwrap();
+            execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        }
+
+        // Verify the table exists.
+        let stmts = parser::parse("SELECT * FROM things").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 2);
+
+        // DROP TABLE.
+        let stmts = parser::parse("DROP TABLE things").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("DROPPED"));
+
+        // Table should no longer be queryable.
+        let stmts = parser::parse("SELECT * FROM things").unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::TableNotFound,
+        );
+
+        // Catalog should not list the table.
+        let stmts = parser::parse(
+            "SELECT * FROM SYSTABLES WHERE name = 'THINGS'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 0);
+
+        // Columns should be gone from SYSCOLUMNS.
+        let stmts = parser::parse(
+            "SELECT * FROM SYSCOLUMNS WHERE tabname = 'THINGS'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 0);
+
+        // Data files should be deleted.
+        let dat = dir.0.join("PUBLIC.THINGS.DAT");
+        let fsm = dir.0.join("PUBLIC.THINGS.FSM");
+        assert!(!dat.exists(), ".DAT file should be deleted");
+        assert!(!fsm.exists(), ".FSM file should be deleted");
+    }
+
+    #[test]
+    fn drop_table_not_found() {
+        let (mut cache, mut tsm, _dir) = test_fixture("dt_notfound");
+        let stmts = parser::parse("DROP TABLE nonexistent").unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::TableNotFound,
+        );
+    }
+
+    #[test]
+    fn drop_table_if_exists_no_error() {
+        let (mut cache, mut tsm, _dir) = test_fixture("dt_ifexists");
+        let stmts = parser::parse("DROP TABLE IF EXISTS nonexistent").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("skipped"));
+    }
+
+    #[test]
+    fn drop_table_system_table_rejected() {
+        let (mut cache, mut tsm, _dir) = test_fixture("dt_systable");
+        let stmts = parser::parse("DROP TABLE RQSYS.SYSTABLES").unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::SystemSchemaViolation,
+        );
+    }
+
+    #[test]
+    fn drop_table_then_recreate() {
+        let (mut cache, mut tsm, _dir) = test_fixture("dt_recreate");
+
+        // Create, drop, and recreate the same table.
+        let stmts = parser::parse(
+            "CREATE TABLE temp (x INTEGER)",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        let stmts = parser::parse("DROP TABLE temp").unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        let stmts = parser::parse(
+            "CREATE TABLE temp (y VARCHAR(20))",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("CREATED"));
+
+        // New table should have column Y, not X.
+        let stmts = parser::parse(
+            "SELECT name FROM SYSCOLUMNS WHERE tabname = 'TEMP'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "Y");
+
+        // Should be usable.
+        let stmts = parser::parse("INSERT INTO temp VALUES ('hello')").unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        let stmts = parser::parse("SELECT * FROM temp").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "hello");
+    }
+
+    #[test]
+    fn drop_table_with_schema() {
+        let (mut cache, mut tsm, _dir) = test_fixture("dt_schema");
+
+        let stmts = parser::parse(
+            "CREATE TABLE myns.data (val INTEGER)",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        let stmts = parser::parse("DROP TABLE myns.data").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("DROPPED"));
+
+        let stmts = parser::parse("SELECT * FROM myns.data").unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::TableNotFound,
         );
     }
 }
