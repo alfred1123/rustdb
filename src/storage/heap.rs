@@ -16,6 +16,29 @@ pub struct Rid {
     pub slot: SlotIndex,
 }
 
+/// Derive the FSM path from a `.DAT` path.
+///
+/// PostgreSQL keeps one FSM per relation, not per segment.  Our DAT files
+/// follow the pattern `SCHEMA.TABLE.<fileid>.DAT`; the FSM drops the
+/// file-ID segment to produce `SCHEMA.TABLE.FSM`.
+///
+/// For test paths without the multi-dot naming (e.g. `foo.DAT`), falls
+/// back to a simple extension replacement.
+pub fn fsm_path_for(dat_path: &Path) -> PathBuf {
+    // Try to strip ".<fileid>.DAT" → "SCHEMA.TABLE.FSM"
+    if let Some(stem) = dat_path.file_name().and_then(|n| n.to_str()) {
+        // Pattern: "SCHEMA.TABLE.0.DAT" → parts = ["SCHEMA", "TABLE", "0", "DAT"]
+        let parts: Vec<&str> = stem.split('.').collect();
+        if parts.len() >= 4 && parts.last() == Some(&"DAT") {
+            // Drop the last two segments (fileid + "DAT"), append "FSM"
+            let base = parts[..parts.len() - 2].join(".");
+            return dat_path.with_file_name(format!("{base}.FSM"));
+        }
+    }
+    // Fallback: simple extension swap.
+    dat_path.with_extension("FSM")
+}
+
 /// A heap file manages a single `.DAT` file as a sequence of slotted pages.
 ///
 /// Each table maps to one heap file. Rows are addressed by [`Rid`].
@@ -50,7 +73,7 @@ impl HeapFile {
             0
         };
 
-        let fsm_path = path.with_extension("FSM");
+        let fsm_path = fsm_path_for(path);
         let fsm = match FreeSpaceMap::load(&fsm_path)? {
             Some(mut loaded) => {
                 // File may have grown since last save.
@@ -249,7 +272,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!("rustdb_test_{name}"));
             // Remove if leftover from a previous run.
             let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(path.with_extension("FSM"));
+            let _ = fs::remove_file(fsm_path_for(&path));
             Self { path }
         }
     }
@@ -257,7 +280,7 @@ mod tests {
     impl Drop for TempFile {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
-            let _ = fs::remove_file(self.path.with_extension("FSM"));
+            let _ = fs::remove_file(fsm_path_for(&self.path));
         }
     }
 

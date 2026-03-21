@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::cache::CatalogCache;
 use crate::error::{Error, Result};
 use crate::storage::fsm::FreeSpaceMap;
-use crate::storage::heap::Rid;
+use crate::storage::heap::{Rid, fsm_path_for};
 use crate::storage::page::{PageRead, PageWrite, UpdateResult};
 use crate::storage::pool::{BufferPoolId, BufferPoolManager, FileId};
 
@@ -87,7 +87,7 @@ impl TablespaceManager {
             })?;
 
             let dat_path = dir.join(format!("{}.{}.0.DAT", table.schemaname, table.name));
-            let fsm_path = dat_path.with_extension("FSM");
+            let fsm_path = fsm_path_for(&dat_path);
             let page_size = ts.pagesize as usize;
             let pool_id = ts.bufferpoolid;
 
@@ -387,7 +387,7 @@ impl TablespaceManager {
             Error::Catalog(format!("no directory for tablespace id {tbspaceid}"))
         })?;
         let dat_path = dir.join(format!("{schema}.{table}.0.DAT"));
-        let fsm_path = dat_path.with_extension("FSM");
+        let fsm_path = fsm_path_for(&dat_path);
 
         let &(pool_id, page_size) = self.ts_pool.get(&tbspaceid).ok_or_else(|| {
             Error::Catalog(format!("no buffer pool mapping for tablespace id {tbspaceid}"))
@@ -472,7 +472,7 @@ mod tests {
                 pool_id: 1,
                 file_id,
                 fsm: FreeSpaceMap::new(0, PAGE_SIZE),
-                fsm_path: dat_path.with_extension("FSM"),
+                fsm_path: fsm_path_for(&dat_path),
             },
         );
 
@@ -576,7 +576,7 @@ mod tests {
                     pool_id: 1,
                     file_id,
                     fsm: FreeSpaceMap::new(0, PAGE_SIZE),
-                    fsm_path: dat_path.with_extension("FSM"),
+                    fsm_path: fsm_path_for(&dat_path),
                 },
             );
             let mut tsm = TablespaceManager {
@@ -601,15 +601,16 @@ mod tests {
             let file_id = pool_manager
                 .register_file(1, &dat_path, PAGE_SIZE)
                 .unwrap();
+            let fsm_path = fsm_path_for(&dat_path);
             let mut table_files = HashMap::new();
             table_files.insert(
                 ("TEST".to_string(), "PERSIST".to_string()),
                 TableFileInfo {
                     pool_id: 1,
                     file_id,
-                    fsm: FreeSpaceMap::load(&dat_path.with_extension("FSM")).unwrap()
+                    fsm: FreeSpaceMap::load(&fsm_path).unwrap()
                         .unwrap_or_else(|| FreeSpaceMap::new(0, PAGE_SIZE)),
-                    fsm_path: dat_path.with_extension("FSM"),
+                    fsm_path,
                 },
             );
             let mut tsm = TablespaceManager {

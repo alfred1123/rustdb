@@ -36,9 +36,13 @@ rustdb/
 
 Files in tablespaces use IBM-style naming:
 ```
-<SCHEMA>.<TABLENAME>.<FILEID>.DAT
+<SCHEMA>.<TABLENAME>.<FILEID>.DAT   # data segments
+<SCHEMA>.<TABLENAME>.FSM             # free-space map (one per table)
 ```
-Example: `RQSYS.SYSTABLES.0.DAT`
+Example: `RQSYS.SYSTABLES.0.DAT`, `RQSYS.SYSTABLES.FSM`
+
+The FSM follows PostgreSQL convention — one per relation, not per segment.
+Use `heap::fsm_path_for(&dat_path)` to derive the FSM path from a DAT path.
 
 ## System Catalog Tables (in `systbsp/`)
 

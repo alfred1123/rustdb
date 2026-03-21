@@ -732,7 +732,9 @@ tables. They are no longer flat binary streams.
 **What changed:**
 
 - **Bootstrap** writes catalog rows into slotted pages via `HeapFile` +
-  `insert_row()`. Each `.DAT` file gets a companion `.FSM` free-space map.
+  `insert_row()`. Each table gets a companion `.FSM` free-space map
+  named `SCHEMA.TABLE.FSM` (one per table, PostgreSQL convention —
+  `heap::fsm_path_for()` derives the path from the `.DAT` path).
 - **Loader** reads catalog via `HeapFile::open()` + `scan()` instead of
   the old flat `[u64_len][bytes]` streaming format.
 - **Tablespace manager** no longer skips `RQSYS` tables during `open()` —
