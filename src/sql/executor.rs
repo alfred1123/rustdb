@@ -1,21 +1,23 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    Expr, SelectItem, SetExpr, Statement, TableFactor,
+    ColumnOption, Expr, SelectItem, SetExpr, Statement, TableFactor,
 };
 
+use crate::catalog;
 use crate::catalog::cache::CatalogCache;
-use crate::catalog::row::{RowReader, RowWriter};
-use crate::catalog::types::Column;
+use crate::catalog::row::{RowReader, RowWriter, LENGTH_PREFIX_SIZE, MIN_COLUMN_BYTES};
+use crate::catalog::types::{Column, Schema, Table, MIN_CHAR_LENGTH, MAX_CHAR_LENGTH};
 use crate::error::{sql_error, Result, SqlState};
 use crate::sql::types::{ResultSet, TableRef, Value};
 use crate::storage::heap::Rid;
+use crate::storage::page::PAGE_HEADER_SIZE;
 use crate::storage::tablespace::TablespaceManager;
 
 /// Execute a parsed SQL statement against the storage engine.
 pub fn execute(
     stmt: &Statement,
-    cache: &CatalogCache,
+    cache: &mut CatalogCache,
     tsm: &mut TablespaceManager,
 ) -> Result<ResultSet> {
     match stmt {
@@ -28,6 +30,9 @@ pub fn execute(
             selection,
             ..
         } => execute_update(table, assignments, selection.as_ref(), cache, tsm),
+        Statement::CreateTable(create_table) => {
+            execute_create_table(create_table, cache, tsm)
+        }
         _ => Err(sql_error(
             SqlState::FeatureNotSupported,
             format!("unsupported statement: {stmt}"),
@@ -57,7 +62,8 @@ fn execute_query(
         return Err(sql_error(SqlState::FeatureNotSupported, "JOINs are not yet supported"));
     }
 
-    let table_ref = resolve_table_factor(&from.relation)?;
+    let table_ref = resolve_table_factor(&from.relation, cache)?;
+    let table_ref = resolve_with_search_path(table_ref, cache);
 
     log::debug!("SELECT from {}.{}", table_ref.schema, table_ref.table);
 
@@ -125,9 +131,10 @@ fn execute_insert(
     tsm: &mut TablespaceManager,
 ) -> Result<ResultSet> {
     let table_ref = match &insert.table {
-        sqlparser::ast::TableObject::TableName(name) => resolve_table_name(name)?,
+        sqlparser::ast::TableObject::TableName(name) => resolve_table_name(name, cache)?,
         _ => return Err(sql_error(SqlState::FeatureNotSupported, "table functions not supported")),
     };
+    let table_ref = resolve_with_search_path(table_ref, cache);
     log::debug!("INSERT into {}.{}", table_ref.schema, table_ref.table);
 
     let columns = cache
@@ -225,7 +232,8 @@ fn execute_delete(
             "exactly one table in DELETE FROM is required",
         ));
     }
-    let table_ref = resolve_table_factor(&from_tables[0].relation)?;
+    let table_ref = resolve_table_factor(&from_tables[0].relation, cache)?;
+    let table_ref = resolve_with_search_path(table_ref, cache);
     log::debug!("DELETE from {}.{}", table_ref.schema, table_ref.table);
 
     let columns = cache
@@ -282,7 +290,8 @@ fn execute_update(
     cache: &CatalogCache,
     tsm: &mut TablespaceManager,
 ) -> Result<ResultSet> {
-    let table_ref = resolve_table_factor(&table.relation)?;
+    let table_ref = resolve_table_factor(&table.relation, cache)?;
+    let table_ref = resolve_with_search_path(table_ref, cache);
     log::debug!("UPDATE {}.{}", table_ref.schema, table_ref.table);
 
     let columns = cache
@@ -360,24 +369,266 @@ fn execute_update(
     })
 }
 
+// ── CREATE TABLE ──
+
+fn execute_create_table(
+    create: &sqlparser::ast::CreateTable,
+    cache: &mut CatalogCache,
+    tsm: &mut TablespaceManager,
+) -> Result<ResultSet> {
+    let table_ref = resolve_table_name(&create.name, cache)?;
+    let schema = &table_ref.schema;
+    let table_name = &table_ref.table;
+    log::debug!("CREATE TABLE {schema}.{table_name}");
+
+    // Reject creating tables in the system catalog schema (only when
+    // explicitly schema-qualified, e.g., CREATE TABLE RQSYS.foo).
+    let explicit_schema = create.name.0.len() > 1;
+    if explicit_schema && cache.is_system_schema(schema) {
+        return Err(sql_error(
+            SqlState::SystemSchemaViolation,
+            format!("cannot create user table in system schema {schema}"),
+        ));
+    }
+
+    // Reject if table already exists.
+    if cache.get_table(schema, table_name).is_some() {
+        return Err(sql_error(
+            SqlState::TableAlreadyExists,
+            format!("table {schema}.{table_name} already exists"),
+        ));
+    }
+
+    if create.columns.is_empty() {
+        return Err(sql_error(
+            SqlState::SyntaxError,
+            "CREATE TABLE requires at least one column",
+        ));
+    }
+
+    // Reject if too many columns (dynamic limit from page size).
+    let tbspaceid = cache.default_tablespace_id();
+    let pagesize = cache
+        .get_tablespace_by_id(tbspaceid as i32)
+        .map(|ts| ts.pagesize as usize)
+        .unwrap_or(4096);
+    let max_payload = pagesize - PAGE_HEADER_SIZE - 4; // header + 1 slot
+    let max_columns = max_payload / MIN_COLUMN_BYTES;
+    if create.columns.len() > max_columns {
+        return Err(sql_error(
+            SqlState::TooManyColumns,
+            format!(
+                "table exceeds maximum column count for {pagesize}-byte pages \
+                 ({} > {max_columns})",
+                create.columns.len(),
+            ),
+        ));
+    }
+
+    // Map sqlparser column definitions to our catalog Column structs.
+    let mut seen_names = std::collections::HashSet::new();
+    let mut columns: Vec<Column> = Vec::with_capacity(create.columns.len());
+    for (ordinal, col_def) in create.columns.iter().enumerate() {
+        let col_name = col_def.name.value.to_uppercase();
+        if !seen_names.insert(col_name.clone()) {
+            return Err(sql_error(
+                SqlState::DuplicateColumnName,
+                format!("duplicate column name: {col_name}"),
+            ));
+        }
+        let type_name = map_data_type(&col_def.data_type)?;
+        let nullable = !col_def.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull));
+        columns.push(Column {
+            name: col_name,
+            tabname: table_name.clone(),
+            schemaname: schema.clone(),
+            ordinal: ordinal as i16,
+            typename: type_name,
+            nullable,
+        });
+    }
+
+    let colcount = columns.len() as i16;
+
+    // Validate that the maximum possible row size fits on a page.
+    let max_row = max_row_size(&columns);
+    if max_row > max_payload {
+        return Err(sql_error(
+            SqlState::RowTooLarge,
+            format!(
+                "maximum row size {max_row} bytes exceeds page limit \
+                 {max_payload} bytes (page size {pagesize})",
+            ),
+        ));
+    }
+
+    // 1. If the schema doesn't exist yet, register it in SYSSCHEMAS.
+    if !cache.has_schema(schema) {
+        let mut w = RowWriter::new();
+        w.write_string(schema);
+        w.write_bool(false);
+        tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSSCHEMAS", &w.finish())?;
+        cache.register_schema(Schema { name: schema.clone(), system: false });
+    }
+
+    // 2. Insert a row into SYSTABLES.
+    let mut w = RowWriter::new();
+    w.write_string(table_name);
+    w.write_string(schema);
+    w.write_i16(tbspaceid);
+    w.write_i16(colcount);
+    tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSTABLES", &w.finish())?;
+
+    // 3. Insert one row per column into SYSCOLUMNS.
+    for col in &columns {
+        let mut w = RowWriter::new();
+        w.write_string(&col.name);
+        w.write_string(&col.tabname);
+        w.write_string(&col.schemaname);
+        w.write_i16(col.ordinal);
+        w.write_string(&col.typename);
+        w.write_bool(col.nullable);
+        tsm.insert_row(catalog::SYSTEM_SCHEMA, "SYSCOLUMNS", &w.finish())?;
+    }
+
+    // 4. Create the empty heap file and register in TSM.
+    tsm.register_new_table(schema, table_name, tbspaceid as i32)?;
+
+    // 5. Register in CatalogCache so subsequent queries see the table.
+    let table = Table {
+        name: table_name.clone(),
+        schemaname: schema.clone(),
+        tbspaceid,
+        colcount,
+    };
+    cache.register_table(table, columns);
+
+    Ok(ResultSet {
+        columns: vec!["STATUS".into()],
+        rows: vec![vec![Value::Str(format!("TABLE {schema}.{table_name} CREATED"))]],
+    })
+}
+
+/// Compute the maximum serialized row size (in bytes) for a set of columns.
+///
+/// Each field is serialized as: 8-byte length prefix (u64 LE) + value bytes.
+/// For variable-length types (VARCHAR), the declared maximum length is used.
+fn max_row_size(columns: &[Column]) -> usize {
+    columns.iter().map(|col| {
+        let base = col.typename.split('(').next().unwrap_or(&col.typename);
+        let data_size = match base {
+            "SMALLINT" => 2,
+            "INTEGER" => 4,
+            "BIGINT" | "DOUBLE" => 8,
+            "TIMESTAMP" => 33, // "YYYY-MM-DD HH:MM:SS.nnnnnnnnn UTC"
+            "CHAR" | "VARCHAR" => {
+                // Extract length from "CHAR(n)" / "VARCHAR(n)".
+                col.typename
+                    .split('(')
+                    .nth(1)
+                    .and_then(|s| s.trim_end_matches(')').parse::<usize>().ok())
+                    .unwrap_or(1)
+            }
+            _ => 255, // conservative default for unknown types
+        };
+        LENGTH_PREFIX_SIZE + data_size
+    }).sum()
+}
+
+/// Validate that a CHAR/VARCHAR length is within bounds.
+fn validate_char_length(length: u64, type_name: &str) -> Result<()> {
+    if length < MIN_CHAR_LENGTH || length > MAX_CHAR_LENGTH {
+        return Err(sql_error(
+            SqlState::InvalidColumnLength,
+            format!(
+                "invalid length {length} for {type_name} \
+                 (must be {MIN_CHAR_LENGTH}..{MAX_CHAR_LENGTH})",
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Map a sqlparser DataType to our catalog type name string.
+fn map_data_type(dt: &sqlparser::ast::DataType) -> Result<String> {
+    use sqlparser::ast::{CharacterLength, DataType};
+    match dt {
+        DataType::SmallInt(_) => Ok("SMALLINT".into()),
+        DataType::Int(_) | DataType::Integer(_) => Ok("INTEGER".into()),
+        DataType::BigInt(_) => Ok("BIGINT".into()),
+        DataType::Double(_) | DataType::DoublePrecision => Ok("DOUBLE".into()),
+        DataType::Varchar(len_opt) => {
+            match len_opt {
+                Some(CharacterLength::IntegerLength { length, .. }) => {
+                    validate_char_length(*length, "VARCHAR")?;
+                    Ok(format!("VARCHAR({length})"))
+                }
+                _ => Ok("VARCHAR(255)".into()), // default length
+            }
+        }
+        DataType::Char(len_opt) | DataType::Character(len_opt) => {
+            match len_opt {
+                Some(CharacterLength::IntegerLength { length, .. }) => {
+                    validate_char_length(*length, "CHAR")?;
+                    Ok(format!("CHAR({length})"))
+                }
+                _ => Ok("CHAR(1)".into()), // default length
+            }
+        }
+        DataType::Timestamp(_, _) => Ok("TIMESTAMP".into()),
+        DataType::Boolean => Ok("CHAR(1)".into()),
+        other => Err(sql_error(
+            SqlState::FeatureNotSupported,
+            format!("unsupported data type: {other}"),
+        )),
+    }
+}
+
 // ── Table reference helpers ──
 
-fn resolve_table_factor(relation: &TableFactor) -> Result<TableRef> {
+/// Apply the schema search path: if the table isn't found in the resolved
+/// schema and the schema is the configured default, try the default schema
+/// then the system schema.  Returns the original ref if nothing matches
+/// (so the caller produces the usual "table not found").
+fn resolve_with_search_path(table_ref: TableRef, cache: &CatalogCache) -> TableRef {
+    // Exact match — no search needed.
+    if cache.get_table(&table_ref.schema, &table_ref.table).is_some() {
+        return table_ref;
+    }
+    // Only search when the user didn't explicitly qualify.
+    let default_schema = &cache.config().default_schema;
+    if table_ref.schema == *default_schema {
+        let mut search_path = vec![default_schema.as_str()];
+        search_path.extend(cache.system_schema_names());
+        for sch in search_path {
+            if cache.get_table(sch, &table_ref.table).is_some() {
+                return TableRef {
+                    schema: sch.to_string(),
+                    table: table_ref.table,
+                };
+            }
+        }
+    }
+    table_ref
+}
+
+fn resolve_table_factor(relation: &TableFactor, cache: &CatalogCache) -> Result<TableRef> {
     match relation {
-        TableFactor::Table { name, .. } => resolve_table_name(name),
+        TableFactor::Table { name, .. } => resolve_table_name(name, cache),
         _ => Err(sql_error(SqlState::FeatureNotSupported, "unsupported FROM clause")),
     }
 }
 
-fn resolve_table_name(name: &sqlparser::ast::ObjectName) -> Result<TableRef> {
+fn resolve_table_name(name: &sqlparser::ast::ObjectName, cache: &CatalogCache) -> Result<TableRef> {
+    let default_schema = &cache.config().default_schema;
     let parts: Vec<&str> = name
         .0
         .iter()
         .map(|i| i.as_ident().unwrap().value.as_str())
         .collect();
     match parts.len() {
-        1 => TableRef::resolve(None, parts[0]),
-        2 => TableRef::resolve(Some(parts[0]), parts[1]),
+        1 => TableRef::resolve(None, parts[0], default_schema),
+        2 => TableRef::resolve(Some(parts[0]), parts[1], default_schema),
         _ => Err(sql_error(
             SqlState::SyntaxError,
             format!("invalid table reference: {name}"),
@@ -679,90 +930,89 @@ mod tests {
         crate::catalog::bootstrap::bootstrap(&dir.0, &cfg).unwrap();
         let catalog =
             crate::catalog::loader::load_catalog(&dir.0, false, cfg.page_size).unwrap();
-        let cache = CatalogCache::new(catalog);
+        let cache = CatalogCache::new(catalog, cfg);
         let tsm = TablespaceManager::open(&dir.0, &cache).unwrap();
         (cache, tsm, dir)
     }
 
     #[test]
     fn select_star_from_systablespaces() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_star");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_star");
         let stmts = parser::parse("SELECT * FROM SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.columns.len(), 7);
         assert_eq!(rs.rows.len(), 3); // 3 tablespaces bootstrapped
     }
 
     #[test]
     fn select_specific_columns() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_cols");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_cols");
         let stmts = parser::parse("SELECT tbspace, tbspaceid FROM SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.columns, vec!["TBSPACE", "TBSPACEID"]);
         assert_eq!(rs.rows.len(), 3);
     }
 
     #[test]
     fn select_with_schema_prefix() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_schema");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_schema");
         let stmts =
             parser::parse("SELECT * FROM RQSYS.SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 3);
     }
 
     #[test]
     fn select_with_where_eq() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_where");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_where");
         let stmts = parser::parse(
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 1",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "SYSTBSP");
     }
 
     #[test]
     fn select_with_where_no_match() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_nomatch");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_nomatch");
         let stmts = parser::parse(
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 99",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 0);
     }
 
     #[test]
     fn select_with_string_where() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_str");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_str");
         let stmts = parser::parse(
             "SELECT * FROM SYSCOLUMNS WHERE tabname = 'SYSTABLESPACES'",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 7); // 7 columns in SYSTABLESPACES
     }
 
     #[test]
     fn select_all_catalog_tables() {
-        let (cache, mut tsm, _dir) = test_fixture("sel_all");
+        let (mut cache, mut tsm, _dir) = test_fixture("sel_all");
 
         // SYSTABLES: 5 tables
         let stmts = parser::parse("SELECT * FROM SYSTABLES").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 5);
 
-        // SYSSCHEMAS: 1 schema
+        // SYSSCHEMAS: 2 schemas (RQSYS + PUBLIC)
         let stmts = parser::parse("SELECT * FROM SYSSCHEMAS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
-        assert_eq!(rs.rows.len(), 1);
-        assert_eq!(rs.rows[0][0].to_string(), "RQSYS");
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 2);
 
         // SYSBUFFERPOOLS: 4 pools
         let stmts = parser::parse("SELECT * FROM SYSBUFFERPOOLS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 4);
     }
 
@@ -770,14 +1020,14 @@ mod tests {
 
     #[test]
     fn insert_and_select() {
-        let (cache, mut tsm, _dir) = test_fixture("ins_sel");
+        let (mut cache, mut tsm, _dir) = test_fixture("ins_sel");
 
         // Insert a new tablespace row.
         let stmts = parser::parse(
             "INSERT INTO SYSTABLESPACES VALUES (10, 'NEWTBSP', 'D', 'A', 4096, 'N', 1)",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "1"); // 1 row inserted
 
         // Verify it's there via SELECT.
@@ -785,97 +1035,97 @@ mod tests {
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 10",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "NEWTBSP");
     }
 
     #[test]
     fn insert_with_column_list() {
-        let (cache, mut tsm, _dir) = test_fixture("ins_cols");
+        let (mut cache, mut tsm, _dir) = test_fixture("ins_cols");
 
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS (NAME) VALUES ('USERSCH')",
+            "INSERT INTO SYSSCHEMAS (NAME, SYSTEMFLAG) VALUES ('USERSCH', 'N')",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "1");
 
         let stmts = parser::parse("SELECT * FROM SYSSCHEMAS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
-        assert_eq!(rs.rows.len(), 2); // RQSYS + USERSCH
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 3); // RQSYS + PUBLIC + USERSCH
     }
 
     #[test]
     fn insert_multiple_rows() {
-        let (cache, mut tsm, _dir) = test_fixture("ins_multi");
+        let (mut cache, mut tsm, _dir) = test_fixture("ins_multi");
 
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS VALUES ('S1'), ('S2'), ('S3')",
+            "INSERT INTO SYSSCHEMAS VALUES ('S1', 'N'), ('S2', 'N'), ('S3', 'N')",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "3");
 
         let stmts = parser::parse("SELECT * FROM SYSSCHEMAS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
-        assert_eq!(rs.rows.len(), 4); // RQSYS + S1 + S2 + S3
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 5); // RQSYS + PUBLIC + S1 + S2 + S3
     }
 
     // ── DELETE tests ──
 
     #[test]
     fn delete_with_where() {
-        let (cache, mut tsm, _dir) = test_fixture("del_where");
+        let (mut cache, mut tsm, _dir) = test_fixture("del_where");
 
         // 3 tablespaces exist. Delete TEMPTBSP (id=3).
         let stmts = parser::parse(
             "DELETE FROM SYSTABLESPACES WHERE tbspaceid = 3",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "1");
 
         let stmts = parser::parse("SELECT * FROM SYSTABLESPACES").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 2); // SYSTBSP + USERTBSP remain
     }
 
     #[test]
     fn delete_all() {
-        let (cache, mut tsm, _dir) = test_fixture("del_all");
+        let (mut cache, mut tsm, _dir) = test_fixture("del_all");
 
         let stmts = parser::parse("DELETE FROM SYSSCHEMAS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
-        assert_eq!(rs.rows[0][0].to_string(), "1"); // 1 schema deleted
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "2"); // RQSYS + PUBLIC deleted
 
         let stmts = parser::parse("SELECT * FROM SYSSCHEMAS").unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 0);
     }
 
     #[test]
     fn delete_no_match() {
-        let (cache, mut tsm, _dir) = test_fixture("del_nomatch");
+        let (mut cache, mut tsm, _dir) = test_fixture("del_nomatch");
 
         let stmts = parser::parse(
             "DELETE FROM SYSTABLESPACES WHERE tbspaceid = 99",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "0");
     }
 
     #[test]
     fn update_with_where() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_where");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_where");
 
         // SYSTBSP has tbspaceid=1. Update its tbspace name.
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET tbspace = 'RENAMED' WHERE tbspaceid = 1",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "1"); // 1 row updated
 
         // Verify it was actually changed.
@@ -883,21 +1133,21 @@ mod tests {
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 1",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "RENAMED");
     }
 
     #[test]
     fn update_all_rows() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_all");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_all");
 
         // Update all tablespace states to 'Y'.
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET state = 'Y'",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "3"); // 3 rows updated
 
         // Verify all rows have state = 'Y'.
@@ -905,38 +1155,38 @@ mod tests {
             "SELECT state FROM SYSTABLESPACES WHERE state = 'Y'",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 3);
     }
 
     #[test]
     fn update_no_match() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_nomatch");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_nomatch");
 
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET tbspace = 'X' WHERE tbspaceid = 99",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "0");
     }
 
     #[test]
     fn update_multiple_columns() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_multi_col");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_multi_col");
 
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET tbspace = 'NEW', tbspacetype = 'S' WHERE tbspaceid = 2",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows[0][0].to_string(), "1");
 
         let stmts = parser::parse(
             "SELECT tbspace, tbspacetype FROM SYSTABLESPACES WHERE tbspaceid = 2",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "NEW");
         assert_eq!(rs.rows[0][1].to_string(), "S");
@@ -944,34 +1194,34 @@ mod tests {
 
     #[test]
     fn update_preserves_unmodified_rows() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_preserve");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_preserve");
 
         // Update only tbspaceid=1, verify others unchanged.
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET tbspace = 'CHANGED' WHERE tbspaceid = 1",
         )
         .unwrap();
-        execute(&stmts[0], &cache, &mut tsm).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
 
         // tbspaceid=2 should be unchanged.
         let stmts = parser::parse(
             "SELECT tbspace FROM SYSTABLESPACES WHERE tbspaceid = 2",
         )
         .unwrap();
-        let rs = execute(&stmts[0], &cache, &mut tsm).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0].to_string(), "USERTBSP");
     }
 
     #[test]
     fn update_column_not_found() {
-        let (cache, mut tsm, _dir) = test_fixture("upd_bad_col");
+        let (mut cache, mut tsm, _dir) = test_fixture("upd_bad_col");
         let stmts = parser::parse(
             "UPDATE SYSTABLESPACES SET bogus = 'X' WHERE tbspaceid = 1",
         )
         .unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &cache, &mut tsm),
+            execute(&stmts[0], &mut cache, &mut tsm),
             SqlState::ColumnNotFound,
         );
     }
@@ -999,40 +1249,261 @@ mod tests {
 
     #[test]
     fn error_table_not_found() {
-        let (cache, mut tsm, _dir) = test_fixture("err_table");
+        let (mut cache, mut tsm, _dir) = test_fixture("err_table");
         let stmts = parser::parse("SELECT * FROM NONEXISTENT").unwrap();
-        assert_sqlstate(execute(&stmts[0], &cache, &mut tsm), SqlState::TableNotFound);
+        assert_sqlstate(execute(&stmts[0], &mut cache, &mut tsm), SqlState::TableNotFound);
     }
 
     #[test]
     fn error_column_not_found() {
-        let (cache, mut tsm, _dir) = test_fixture("err_col");
+        let (mut cache, mut tsm, _dir) = test_fixture("err_col");
         let stmts =
             parser::parse("SELECT bogus FROM SYSTABLESPACES").unwrap();
-        assert_sqlstate(execute(&stmts[0], &cache, &mut tsm), SqlState::ColumnNotFound);
+        assert_sqlstate(execute(&stmts[0], &mut cache, &mut tsm), SqlState::ColumnNotFound);
     }
 
     #[test]
     fn error_column_not_found_in_where() {
-        let (cache, mut tsm, _dir) = test_fixture("err_col_where");
+        let (mut cache, mut tsm, _dir) = test_fixture("err_col_where");
         let stmts = parser::parse(
             "SELECT * FROM SYSTABLESPACES WHERE bogus = 1",
         )
         .unwrap();
-        assert_sqlstate(execute(&stmts[0], &cache, &mut tsm), SqlState::ColumnNotFound);
+        assert_sqlstate(execute(&stmts[0], &mut cache, &mut tsm), SqlState::ColumnNotFound);
+    }
+
+    // ── CREATE TABLE tests ──
+
+    #[test]
+    fn create_table_basic() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_basic");
+        let stmts = parser::parse(
+            "CREATE TABLE employees (id INTEGER NOT NULL, name VARCHAR(50), active CHAR(1))",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("CREATED"));
+
+        // Table should be visible in SYSTABLES.
+        let stmts = parser::parse(
+            "SELECT name, colcount FROM SYSTABLES WHERE name = 'EMPLOYEES'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "EMPLOYEES");
+        assert_eq!(rs.rows[0][1].to_string(), "3");
     }
 
     #[test]
-    fn error_unsupported_create_table() {
-        let (cache, mut tsm, _dir) = test_fixture("err_create");
+    fn create_table_insert_and_select() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_ins_sel");
         let stmts = parser::parse(
-            "CREATE TABLE foo (id INTEGER)",
-        )
-        .unwrap();
+            "CREATE TABLE items (id INTEGER NOT NULL, label VARCHAR(30))",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        // INSERT into the new table.
+        let stmts = parser::parse(
+            "INSERT INTO items VALUES (1, 'Widget')",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "1");
+
+        // SELECT from the new table.
+        let stmts = parser::parse("SELECT * FROM items").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.columns, vec!["ID", "LABEL"]);
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "1");
+        assert_eq!(rs.rows[0][1].to_string(), "Widget");
+    }
+
+    #[test]
+    fn create_table_with_schema() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_schema");
+        let stmts = parser::parse(
+            "CREATE TABLE myapp.users (uid INTEGER NOT NULL, email VARCHAR(100))",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("CREATED"));
+
+        // New schema should appear in SYSSCHEMAS.
+        let stmts = parser::parse(
+            "SELECT name FROM SYSSCHEMAS WHERE name = 'MYAPP'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+
+        // INSERT and SELECT through the schema-qualified name.
+        let stmts = parser::parse(
+            "INSERT INTO myapp.users VALUES (42, 'alice@example.com')",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        let stmts = parser::parse("SELECT * FROM myapp.users").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0].to_string(), "42");
+    }
+
+    #[test]
+    fn create_table_duplicate_rejected() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_dup");
+        let stmts = parser::parse(
+            "CREATE TABLE dup_test (x INTEGER)",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        // Second CREATE TABLE with same name should fail.
+        let stmts = parser::parse(
+            "CREATE TABLE dup_test (y VARCHAR(10))",
+        ).unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &cache, &mut tsm),
-            SqlState::FeatureNotSupported,
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::TableAlreadyExists,
         );
+    }
+
+    #[test]
+    fn create_table_row_too_large() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_toobig");
+        // Page size is 4096. Header=24, slot=4 → max payload=4068.
+        // VARCHAR(4000) → 8+4000=4008, plus an INTEGER → 8+4=12.
+        // Total: 4020 bytes — fits. Add another VARCHAR(100) → 8+100=108
+        // giving 4128 — exceeds 4068.
+        let stmts = parser::parse(
+            "CREATE TABLE toobig (id INTEGER, data VARCHAR(4000), extra VARCHAR(100))",
+        ).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::RowTooLarge,
+        );
+    }
+
+    #[test]
+    fn create_table_row_just_fits() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_justfit");
+        // max payload = 4068. INTEGER=12, VARCHAR(4048)=8+4048=4056 → 4068 exactly.
+        let stmts = parser::parse(
+            "CREATE TABLE justfit (id INTEGER, data VARCHAR(4048))",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert!(rs.rows[0][0].to_string().contains("CREATED"));
+    }
+
+    #[test]
+    fn create_table_duplicate_column_name() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_dup_col");
+        let stmts = parser::parse(
+            "CREATE TABLE bad (id INTEGER, name VARCHAR(10), id SMALLINT)",
+        ).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::DuplicateColumnName,
+        );
+    }
+
+    #[test]
+    fn create_table_invalid_char_length_zero() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_len0");
+        let stmts = parser::parse(
+            "CREATE TABLE bad (name CHAR(0))",
+        ).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::InvalidColumnLength,
+        );
+    }
+
+    #[test]
+    fn create_table_invalid_varchar_length_too_large() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_len_big");
+        let stmts = parser::parse(
+            "CREATE TABLE bad (data VARCHAR(40000))",
+        ).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::InvalidColumnLength,
+        );
+    }
+
+    #[test]
+    fn create_table_too_many_columns() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_maxcol");
+        // Page 4096: max_payload=4068, min 9 bytes/col → limit=452.
+        // 453 CHAR(1) columns should exceed the dynamic limit.
+        let cols: Vec<String> = (0..453).map(|i| format!("c{i} CHAR(1)")).collect();
+        let sql = format!("CREATE TABLE huge ({})", cols.join(", "));
+        let stmts = parser::parse(&sql).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::TooManyColumns,
+        );
+    }
+
+    #[test]
+    fn create_table_system_schema_rejected() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_rqsys");
+        let stmts = parser::parse(
+            "CREATE TABLE RQSYS.forbidden (id INTEGER)",
+        ).unwrap();
+        assert_sqlstate(
+            execute(&stmts[0], &mut cache, &mut tsm),
+            SqlState::SystemSchemaViolation,
+        );
+    }
+
+    #[test]
+    fn create_table_columns_in_syscolumns() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_cols");
+        let stmts = parser::parse(
+            "CREATE TABLE parts (partno SMALLINT NOT NULL, descr VARCHAR(80), qty INTEGER)",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        // SYSCOLUMNS should have 3 new rows for PARTS.
+        let stmts = parser::parse(
+            "SELECT name, typename, nullable FROM SYSCOLUMNS WHERE tabname = 'PARTS'",
+        ).unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 3);
+        // First column: PARTNO SMALLINT NOT NULL
+        assert_eq!(rs.rows[0][0].to_string(), "PARTNO");
+        assert_eq!(rs.rows[0][1].to_string(), "SMALLINT");
+        assert_eq!(rs.rows[0][2].to_string(), "N"); // not nullable
+    }
+
+    #[test]
+    fn create_table_delete_and_update() {
+        let (mut cache, mut tsm, _dir) = test_fixture("ct_del_upd");
+        let stmts = parser::parse(
+            "CREATE TABLE kv (k INTEGER NOT NULL, v VARCHAR(20))",
+        ).unwrap();
+        execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+
+        // Insert two rows.
+        for sql in [
+            "INSERT INTO kv VALUES (1, 'alpha')",
+            "INSERT INTO kv VALUES (2, 'beta')",
+        ] {
+            let stmts = parser::parse(sql).unwrap();
+            execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        }
+
+        // UPDATE one row.
+        let stmts = parser::parse("UPDATE kv SET v = 'gamma' WHERE k = 1").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "1");
+
+        // DELETE one row.
+        let stmts = parser::parse("DELETE FROM kv WHERE k = 2").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows[0][0].to_string(), "1");
+
+        // Verify final state.
+        let stmts = parser::parse("SELECT * FROM kv").unwrap();
+        let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][1].to_string(), "gamma");
     }
 
     #[test]
@@ -1044,42 +1515,42 @@ mod tests {
 
     #[test]
     fn error_insert_value_list_mismatch() {
-        let (cache, mut tsm, _dir) = test_fixture("err_val_cnt");
+        let (mut cache, mut tsm, _dir) = test_fixture("err_val_cnt");
         // SYSTABLESPACES has 7 columns but we provide only 2 values.
         let stmts = parser::parse(
             "INSERT INTO SYSTABLESPACES VALUES (1, 'X')",
         )
         .unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &cache, &mut tsm),
+            execute(&stmts[0], &mut cache, &mut tsm),
             SqlState::InsertValueListMismatch,
         );
     }
 
     #[test]
     fn error_not_null_violation() {
-        let (cache, mut tsm, _dir) = test_fixture("err_null");
-        // SYSSCHEMAS has 1 column (NAME VARCHAR). Insert NULL.
+        let (mut cache, mut tsm, _dir) = test_fixture("err_null");
+        // SYSSCHEMAS has 2 columns (NAME VARCHAR, SYSTEMFLAG CHAR(1)). Insert NULL.
         let stmts = parser::parse(
-            "INSERT INTO SYSSCHEMAS VALUES (NULL)",
+            "INSERT INTO SYSSCHEMAS VALUES (NULL, 'N')",
         )
         .unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &cache, &mut tsm),
+            execute(&stmts[0], &mut cache, &mut tsm),
             SqlState::NotNullViolation,
         );
     }
 
     #[test]
     fn error_type_mismatch() {
-        let (cache, mut tsm, _dir) = test_fixture("err_type");
+        let (mut cache, mut tsm, _dir) = test_fixture("err_type");
         // SYSTABLESPACES first column is SMALLINT. Insert a string.
         let stmts = parser::parse(
             "INSERT INTO SYSTABLESPACES VALUES ('not_a_number', 'X', 'D', 'A', 4096, 'N', 1)",
         )
         .unwrap();
         assert_sqlstate(
-            execute(&stmts[0], &cache, &mut tsm),
+            execute(&stmts[0], &mut cache, &mut tsm),
             SqlState::AssignmentError,
         );
     }

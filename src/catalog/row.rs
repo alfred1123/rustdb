@@ -1,5 +1,13 @@
 use crate::error::{Error, Result};
 
+/// Per-field overhead: u64 LE length prefix (8 bytes).
+pub const LENGTH_PREFIX_SIZE: usize = 8;
+
+/// Minimum serialized bytes per column: length prefix + 1 byte data
+/// (smallest possible value is CHAR(1)).  Used to derive the dynamic
+/// column-count limit from the page size.
+pub const MIN_COLUMN_BYTES: usize = LENGTH_PREFIX_SIZE + 1;
+
 /// Reads length-prefixed fields from a binary row.
 ///
 /// Wire format per field: [u64 LE byte_length][value_bytes]

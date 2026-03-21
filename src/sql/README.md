@@ -8,7 +8,7 @@ SQL parser, planner, and executor.
 |---------------|-----------------------------------------------------|
 | `parser.rs`   | Parses SQL strings via `sqlparser` (generic dialect) |
 | `types.rs`    | `Value` enum, `ResultSet`, `TableRef`               |
-| `executor.rs` | Executes SELECT, INSERT, UPDATE, DELETE via TablespaceManager |
+| `executor.rs` | Executes SELECT, INSERT, UPDATE, DELETE, CREATE TABLE via TablespaceManager |
 
 ## Supported SQL
 
@@ -32,6 +32,54 @@ SQL parser, planner, and executor.
 
 - `DELETE FROM <table>` — delete all rows
 - `DELETE FROM <table> WHERE col = value` — conditional delete
+
+### CREATE TABLE
+
+- `CREATE TABLE <table> (col1 TYPE, col2 TYPE NOT NULL, ...)` — create a new table
+- `CREATE TABLE schema.table (...)` — create in a specific schema (auto-creates the schema)
+- Supported types: `SMALLINT`, `INTEGER`, `BIGINT`, `CHAR(n)`, `VARCHAR(n)`, `DOUBLE`, `TIMESTAMP`
+- `NOT NULL` column constraint is recognized; all columns default to nullable
+- New table is placed in the default tablespace (`DFT_TBSP` from SQLDBCONF, default: USERTBSP)
+- Catalog rows are persisted to SYSTABLES and SYSCOLUMNS immediately
+- CatalogCache is updated in-memory so subsequent queries see the table instantly
+- Row size validation: rejects tables whose maximum row size exceeds the page payload limit
+  (page size − 24-byte header − 4-byte slot = max payload). Returns SQLSTATE 54010.
+- Duplicate column names rejected (SQLSTATE 42711)
+- Invalid CHAR/VARCHAR lengths rejected: must be 1–32672 (SQLSTATE 42611)
+- Column count limit: dynamically derived from page size (max payload / `MIN_COLUMN_BYTES`).
+  For a 4KB page this is 452 columns; for 8KB it's 907 (SQLSTATE 54011)
+- System schema protection: `CREATE TABLE RQSYS.<name>` is rejected (SQLSTATE 42508).
+  Any schema with `SYSTEMFLAG='Y'` in SYSSCHEMAS is protected.
+  Unqualified names default to the configured default schema (`DFT_SCHEMA`) for DDL.
+
+### Schema Resolution & Search Path
+
+- Unqualified table names default to the **configured default schema** (`DFT_SCHEMA`
+  in `SQLDBCONF`, default: `PUBLIC`).
+- DML statements (SELECT, INSERT, UPDATE, DELETE) use a **search path**:
+  `[DFT_SCHEMA, <all system schemas>]`.  If the table isn't found in the default
+  schema, system schemas (those with `SYSTEMFLAG='Y'` in SYSSCHEMAS) are tried
+  automatically — so `SELECT * FROM SYSTABLES` still works without a schema prefix.
+- DDL (CREATE TABLE) does **not** search — it always creates in the resolved
+  schema (default schema or the explicit schema if given).
+- System schemas are identified by the `SYSTEMFLAG` column in `RQSYS.SYSSCHEMAS`,
+  not by hardcoded name comparison. Any schema with `SYSTEMFLAG='Y'` is protected
+  from user DDL.
+
+### Configuration-Driven Constants
+
+The executor has no hardcoded configuration values.  All tunable parameters are
+centralized in three places:
+
+| Constant | Location | Purpose |
+|----------|----------|---------|
+| `SYSTEM_SCHEMA` | `catalog/mod.rs` | System catalog schema name (`RQSYS`) — file-path / catalog-key use only |
+| `LENGTH_PREFIX_SIZE` | `catalog/row.rs` | Row wire-format overhead per field (8 bytes) |
+| `MIN_COLUMN_BYTES` | `catalog/row.rs` | Minimum serialized bytes per column (9) |
+| `MIN_CHAR_LENGTH` | `catalog/types.rs` | Minimum CHAR/VARCHAR length (1) |
+| `MAX_CHAR_LENGTH` | `catalog/types.rs` | Maximum CHAR/VARCHAR length (32 672) |
+| `DFT_SCHEMA` | `SQLDBCONF` → `DbConfig` | Default schema for unqualified names |
+| `DFT_TBSP` | `SQLDBCONF` → `DbConfig` | Default tablespace name, resolved to ID at runtime |
 
 ### UPDATE
 
@@ -106,7 +154,11 @@ execute_update()
 - [ ] `BETWEEN` expression in WHERE
 - [ ] Arithmetic expressions (`+`, `-`, `*`, `/`) in SELECT and WHERE
 - [ ] `DISTINCT` keyword
-- [ ] `CREATE TABLE` / `DROP TABLE` (DDL)
+- [x] `CREATE TABLE` (DDL) — implemented
+- [ ] `DROP TABLE` (DDL)
+- [ ] `CREATE SCHEMA` (DDL)
+- [ ] `DROP SCHEMA` (DDL)
+- [ ] `SET SCHEMA` / `SET CURRENT SCHEMA` — change default schema for session
 
 ### Longer-term
 
@@ -119,11 +171,11 @@ execute_update()
 
 ## TODO — Multi-threaded Executor
 
-The executor currently takes `&CatalogCache` (single-threaded borrow). When
-multi-session is added, change to `Arc<RwLock<CatalogCache>>` and acquire a
-shared read lock for the duration of query execution. DDL statements will
-need a write lock to mutate the cache. No cache eviction is needed at our
-target scale (≤10K tables).
+The executor takes `&mut CatalogCache` so DDL statements (CREATE TABLE) can
+register new tables in the cache immediately. When multi-session is added,
+change to `Arc<RwLock<CatalogCache>>` and acquire a shared read lock for DML
+queries and a write lock for DDL. No cache eviction is needed at our target
+scale (≤10K tables).
 
 ## SQLSTATE Error Codes
 
@@ -138,9 +190,20 @@ Errors follow the ANSI SQL SQLSTATE convention (5-character codes):
 | 23502 | NOT NULL violation                 | `INSERT` with NULL for non-nullable column   |
 | 42000 | Syntax error                       | Invalid table reference, empty identifier    |
 | 42601 | Parse error                        | `SELEC * FORM table`                         |
-| 42S02 | Table not found                    | `SELECT * FROM NONEXISTENT`                  |
+| 42S02 | Table not found                    | `SELECT * FROM NONEXISTENT`                  || 42S01 | Table already exists               | `CREATE TABLE x(...)` when x exists          |
 | 42S22 | Column not found                   | `SELECT bogus FROM SYSTABLESPACES`           |
+| 42508 | System schema violation            | `CREATE TABLE RQSYS.x(...)`                  |
+| 42611 | Invalid column length              | `CHAR(0)` or `VARCHAR(40000)`                |
+| 42711 | Duplicate column name              | `CREATE TABLE t (x INT, x INT)`              |
+| 54010 | Row too large for page size        | `CREATE TABLE` with columns exceeding page   |
+| 54011 | Too many columns                   | Column count exceeds page-derived limit      |
 | 0A000 | Feature not supported              | JOINs, unsupported expressions               |
+
+**Low priority / planned:**
+
+| Code  | Meaning                            | Notes                                        |
+|-------|------------------------------------|----------------------------------------------|
+| 54008 | Too many tablespaces               | Reject when tablespace capacity is exhausted |
 
 ## Complexity Analysis (Big O)
 
@@ -370,7 +433,8 @@ To be usable as a general-purpose SQL engine:
 - [ ] `GROUP BY` + aggregates (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`)
 - [ ] JOINs (nested-loop first, then hash join and merge join)
 - [ ] Subqueries and CTEs
-- [ ] `CREATE TABLE` / `DROP TABLE`
+- [x] `CREATE TABLE`
+- [ ] `DROP TABLE`
 - [ ] `ALTER TABLE`
 - [ ] Constraints (`PRIMARY KEY`, `FOREIGN KEY`, `UNIQUE`, `CHECK`)
 - [ ] `NULL` handling (`IS NULL`, three-valued logic)
@@ -386,7 +450,7 @@ To be usable as a general-purpose SQL engine:
 | 5. WAL-logged DML | Crash-safe mutations via write-ahead log | ⏳ Design complete, implementation planned |
 | 6. Query planner | Cost-based optimizer with multiple access paths | ❌ Not started |
 | 7. Transactions | ACID transactions with MVCC concurrency | ❌ Not started |
-| 8. DDL | CREATE/DROP/ALTER TABLE, CREATE INDEX | ❌ Not started |
+| 8. DDL | CREATE/DROP/ALTER TABLE, CREATE INDEX | ⏳ CREATE TABLE complete |
 | 9. Advanced SQL | JOINs, aggregates, subqueries, ORDER BY | ❌ Not started |
 | 10. Production | Connection pooling, auth, replication | ❌ Not started |
 

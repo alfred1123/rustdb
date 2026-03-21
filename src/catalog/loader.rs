@@ -6,7 +6,7 @@ use crate::catalog::types::*;
 use crate::error::{Error, Result};
 use crate::storage::heap::HeapFile;
 
-const SCHEMA: &str = "RQSYS";
+use super::SYSTEM_SCHEMA;
 
 /// Load the full system catalog from a database directory.
 pub fn load_catalog(data_dir: &Path, text_mode: bool, page_size: usize) -> Result<Catalog> {
@@ -33,7 +33,7 @@ pub fn load_catalog(data_dir: &Path, text_mode: bool, page_size: usize) -> Resul
 // ── Shared helpers ──
 
 fn read_binary_rows(dir: &Path, table: &str, page_size: usize) -> Result<Vec<Vec<u8>>> {
-    let path = dir.join(format!("{SCHEMA}.{table}.0.DAT"));
+    let path = dir.join(format!("{SYSTEM_SCHEMA}.{table}.0.DAT"));
     if !path.exists() {
         return Err(Error::Catalog(format!("catalog file not found: {}", path.display())));
     }
@@ -43,7 +43,7 @@ fn read_binary_rows(dir: &Path, table: &str, page_size: usize) -> Result<Vec<Vec
 }
 
 fn read_text_rows(dir: &Path, table: &str) -> Result<Vec<Vec<String>>> {
-    let path = dir.join(format!("{SCHEMA}.{table}.0.DAT"));
+    let path = dir.join(format!("{SYSTEM_SCHEMA}.{table}.0.DAT"));
     let content = fs::read_to_string(&path).map_err(|e| {
         Error::Catalog(format!("failed to read {}: {e}", path.display()))
     })?;
@@ -108,14 +108,20 @@ fn load_schemas(dir: &Path, text_mode: bool, page_size: usize) -> Result<Vec<Sch
     if text_mode {
         read_text_rows(dir, "SYSSCHEMAS")?
             .iter()
-            .map(|r| Ok(Schema { name: col(r, 0, "SYSSCHEMAS")? }))
+            .map(|r| Ok(Schema {
+                name: col(r, 0, "SYSSCHEMAS")?,
+                system: col(r, 1, "SYSSCHEMAS")? == "Y",
+            }))
             .collect()
     } else {
         read_binary_rows(dir, "SYSSCHEMAS", page_size)?
             .iter()
             .map(|row| {
                 let mut r = RowReader::new(row);
-                Ok(Schema { name: r.read_string()? })
+                Ok(Schema {
+                    name: r.read_string()?,
+                    system: r.read_bool()?,
+                })
             })
             .collect()
     }

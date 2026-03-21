@@ -13,6 +13,12 @@ const DEFAULT_PAGE_SIZE: usize = 4096;
 /// Diagnostic level names (DB2-style DIAGLEVEL).
 const VALID_DIAGLEVELS: &[&str] = &["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
+/// Default schema for unqualified table references (DB2: DFT_SCHEMA).
+const DEFAULT_DFT_SCHEMA: &str = "PUBLIC";
+
+/// Default tablespace name for user tables (DB2: DFT_TBSP).
+const DEFAULT_DFT_TABLESPACE: &str = "USERTBSP";
+
 /// Database configuration parameters stored in `admin/SQLDBCONF`.
 ///
 /// Follows the DB2 convention of a per-database configuration file.
@@ -25,6 +31,10 @@ pub struct DbConfig {
     pub diag_level: String,
     /// When true, catalog `.DAT` files use TSV text format instead of binary.
     pub text_mode: bool,
+    /// Default schema for unqualified table names (DB2: DFT_SCHEMA).
+    pub default_schema: String,
+    /// Default tablespace name for user-created tables (DB2: DFT_TBSP).
+    pub default_tablespace: String,
 }
 
 impl Default for DbConfig {
@@ -33,6 +43,8 @@ impl Default for DbConfig {
             page_size: DEFAULT_PAGE_SIZE,
             diag_level: "INFO".to_string(),
             text_mode: false,
+            default_schema: DEFAULT_DFT_SCHEMA.to_string(),
+            default_tablespace: DEFAULT_DFT_TABLESPACE.to_string(),
         }
     }
 }
@@ -54,10 +66,18 @@ DIAGLEVEL = {}
 
 -- Data file format: TRUE = tab-separated text, FALSE = binary.
 TEXT_MODE = {}
+
+-- Default schema for unqualified table names (DB2: DFT_SCHEMA).
+DFT_SCHEMA = {}
+
+-- Default tablespace for user-created tables (DB2: DFT_TBSP).
+DFT_TBSP = {}
 ",
             self.page_size,
             self.diag_level,
             if self.text_mode { "TRUE" } else { "FALSE" },
+            self.default_schema,
+            self.default_tablespace,
         );
         fs::write(&path, content)?;
         log::info!("wrote {}", path.display());
@@ -91,10 +111,22 @@ TEXT_MODE = {}
 
         let text_mode = parse_bool(&map, "TEXT_MODE", false)?;
 
+        let default_schema = map
+            .get("DFT_SCHEMA")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_DFT_SCHEMA.to_string());
+
+        let default_tablespace = map
+            .get("DFT_TBSP")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_DFT_TABLESPACE.to_string());
+
         Ok(Self {
             page_size,
             diag_level,
             text_mode,
+            default_schema,
+            default_tablespace,
         })
     }
 }
@@ -161,6 +193,8 @@ mod tests {
         assert_eq!(loaded.page_size, DEFAULT_PAGE_SIZE);
         assert_eq!(loaded.diag_level, "INFO");
         assert!(!loaded.text_mode);
+        assert_eq!(loaded.default_schema, "PUBLIC");
+        assert_eq!(loaded.default_tablespace, "USERTBSP");
         fs::remove_dir_all(&dir).unwrap();
     }
 

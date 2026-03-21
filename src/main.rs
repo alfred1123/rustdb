@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
 
     let systables_path = data_dir
         .join("systbsp")
-        .join("RQSYS.SYSTABLES.0.DAT");
+        .join(format!("{}.SYSTABLES.0.DAT", catalog::SYSTEM_SCHEMA));
 
     let config = if !systables_path.exists() {
         log::info!("bootstrapping new database at {}", data_dir.display());
@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         config.page_size, config.diag_level, config.text_mode);
 
     let catalog = catalog::loader::load_catalog(&data_dir, config.text_mode, config.page_size)?;
-    let cache = catalog::cache::CatalogCache::new(catalog);
+    let mut cache = catalog::cache::CatalogCache::new(catalog, config);
     log::info!("catalog cache built");
 
     let mut tsm = storage::tablespace::TablespaceManager::open(&data_dir, &cache)?;
@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     println!("RustDB — interactive SQL shell");
     println!("Type SQL queries or \\q to quit.\n");
 
-    repl(&cache, &mut tsm)?;
+    repl(&mut cache, &mut tsm)?;
 
     tsm.flush_all()?;
     log::info!("shutdown complete");
@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn repl(
-    cache: &catalog::cache::CatalogCache,
+    cache: &mut catalog::cache::CatalogCache,
     tsm: &mut storage::tablespace::TablespaceManager,
 ) -> anyhow::Result<()> {
     let stdin = io::stdin();

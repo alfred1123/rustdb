@@ -47,6 +47,18 @@ pub enum SqlState {
     InsertValueListMismatch,
     /// 26000 — Invalid SQL statement name
     InvalidSqlStatement,
+    /// 42S01 — Base table already exists
+    TableAlreadyExists,
+    /// 54010 — Row size too large for page size
+    RowTooLarge,
+    /// 42711 — Duplicate column name in definition
+    DuplicateColumnName,
+    /// 42611 — Invalid length for character type
+    InvalidColumnLength,
+    /// 54011 — Too many columns in table definition
+    TooManyColumns,
+    /// 42508 — Cannot create object in system schema
+    SystemSchemaViolation,
 }
 
 impl std::fmt::Display for SqlState {
@@ -64,6 +76,12 @@ impl std::fmt::Display for SqlState {
             SqlState::NotNullViolation => "23502",
             SqlState::InsertValueListMismatch => "21S01",
             SqlState::InvalidSqlStatement => "26000",
+            SqlState::TableAlreadyExists => "42S01",
+            SqlState::RowTooLarge => "54010",
+            SqlState::DuplicateColumnName => "42711",
+            SqlState::InvalidColumnLength => "42611",
+            SqlState::TooManyColumns => "54011",
+            SqlState::SystemSchemaViolation => "42508",
         };
         write!(f, "{code}")
     }

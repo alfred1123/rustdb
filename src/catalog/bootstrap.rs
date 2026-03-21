@@ -6,7 +6,7 @@ use crate::catalog::row::RowWriter;
 use crate::error::Result;
 use crate::storage::heap::HeapFile;
 
-const SCHEMA: &str = "RQSYS";
+use super::SYSTEM_SCHEMA;
 
 /// Create a fresh database with system catalog tables.
 pub fn bootstrap(data_dir: &Path, config: &DbConfig) -> Result<()> {
@@ -30,7 +30,7 @@ pub fn bootstrap(data_dir: &Path, config: &DbConfig) -> Result<()> {
 }
 
 fn write_dat(dir: &Path, table: &str, header: &str, text_rows: &[String], binary_rows: &[Vec<u8>], text_mode: bool, page_size: usize) -> Result<()> {
-    let path = dir.join(format!("{SCHEMA}.{table}.0.DAT"));
+    let path = dir.join(format!("{SYSTEM_SCHEMA}.{table}.0.DAT"));
     if text_mode {
         let mut content = String::from(header);
         content.push('\n');
@@ -80,29 +80,41 @@ fn write_systablespaces(dir: &Path, page_size: usize, text_mode: bool) -> Result
 }
 
 fn write_sysschemas(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
-    let mut w = RowWriter::new();
-    w.write_string(SCHEMA);
-    write_dat(dir, "SYSSCHEMAS", "NAME", &[SCHEMA.to_string()], &[w.finish()], text_mode, page_size)
+    // (name, system_flag)
+    let schemas: [(&str, bool); 2] = [
+        (SYSTEM_SCHEMA, true),
+        ("PUBLIC", false),
+    ];
+    let text_rows: Vec<String> = schemas.iter()
+        .map(|(s, sys)| format!("{s}\t{}", if *sys { "Y" } else { "N" }))
+        .collect();
+    let binary_rows: Vec<Vec<u8>> = schemas.iter().map(|(s, sys)| {
+        let mut w = RowWriter::new();
+        w.write_string(s);
+        w.write_bool(*sys);
+        w.finish()
+    }).collect();
+    write_dat(dir, "SYSSCHEMAS", "NAME\tSYSTEMFLAG", &text_rows, &binary_rows, text_mode, page_size)
 }
 
 fn write_systables(dir: &Path, page_size: usize, text_mode: bool) -> Result<()> {
     let tables: [(&str, i16); 5] = [
         ("SYSTABLESPACES", 7i16),
-        ("SYSSCHEMAS", 1),
+        ("SYSSCHEMAS", 2),
         ("SYSTABLES", 4),
         ("SYSCOLUMNS", 6),
         ("SYSBUFFERPOOLS", 4),
     ];
 
     let text_rows: Vec<String> = tables.iter()
-        .map(|(name, cc)| format!("{name}\t{SCHEMA}\t1\t{cc}"))
+        .map(|(name, cc)| format!("{name}\t{SYSTEM_SCHEMA}\t1\t{cc}"))
         .collect();
 
     let binary_rows: Vec<Vec<u8>> = tables.iter()
         .map(|(name, col_count)| {
             let mut w = RowWriter::new();
             w.write_string(name);
-            w.write_string(SCHEMA);
+            w.write_string(SYSTEM_SCHEMA);
             w.write_i16(1);
             w.write_i16(*col_count);
             w.finish()
@@ -122,6 +134,7 @@ fn write_syscolumns(dir: &Path, page_size: usize, text_mode: bool) -> Result<()>
         ("STATE", "SYSTABLESPACES", 5, "CHAR(1)", false),
         ("BUFFERPOOLID", "SYSTABLESPACES", 6, "INTEGER", false),
         ("NAME", "SYSSCHEMAS", 0, "VARCHAR(128)", false),
+        ("SYSTEMFLAG", "SYSSCHEMAS", 1, "CHAR(1)", false),
         ("NAME", "SYSTABLES", 0, "VARCHAR(128)", false),
         ("SCHEMANAME", "SYSTABLES", 1, "VARCHAR(128)", false),
         ("TBSPACEID", "SYSTABLES", 2, "SMALLINT", false),
@@ -141,7 +154,7 @@ fn write_syscolumns(dir: &Path, page_size: usize, text_mode: bool) -> Result<()>
     let text_rows: Vec<String> = cols.iter()
         .map(|(name, table, ord, tn, nullable)| {
             let flag = if *nullable { "Y" } else { "N" };
-            format!("{name}\t{table}\t{SCHEMA}\t{ord}\t{tn}\t{flag}")
+            format!("{name}\t{table}\t{SYSTEM_SCHEMA}\t{ord}\t{tn}\t{flag}")
         })
         .collect();
 
@@ -150,7 +163,7 @@ fn write_syscolumns(dir: &Path, page_size: usize, text_mode: bool) -> Result<()>
             let mut w = RowWriter::new();
             w.write_string(name);
             w.write_string(table);
-            w.write_string(SCHEMA);
+            w.write_string(SYSTEM_SCHEMA);
             w.write_i16(*ordinal);
             w.write_string(type_name);
             w.write_bool(*nullable);

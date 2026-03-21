@@ -1,3 +1,10 @@
+/// Minimum valid length for CHAR / VARCHAR columns (ANSI SQL).
+pub const MIN_CHAR_LENGTH: u64 = 1;
+
+/// Maximum valid length for CHAR / VARCHAR columns.
+/// Follows the DB2 convention: 32 672 bytes per column.
+pub const MAX_CHAR_LENGTH: u64 = 32672;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     SmallInt,
@@ -23,6 +30,8 @@ pub struct Tablespace {
 #[derive(Debug, Clone)]
 pub struct Schema {
     pub name: String,
+    /// Whether this schema is a system schema (protected from DDL).
+    pub system: bool,
 }
 
 #[derive(Debug, Clone)]

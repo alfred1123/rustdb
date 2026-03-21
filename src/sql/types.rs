@@ -94,8 +94,8 @@ pub struct TableRef {
 }
 
 impl TableRef {
-    pub fn resolve(schema: Option<&str>, table: &str) -> Result<Self> {
-        let schema = schema.unwrap_or("RQSYS").to_uppercase();
+    pub fn resolve(schema: Option<&str>, table: &str, default_schema: &str) -> Result<Self> {
+        let schema = schema.unwrap_or(default_schema).to_uppercase();
         let table = table.to_uppercase();
         Ok(Self { schema, table })
     }

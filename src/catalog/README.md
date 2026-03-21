@@ -6,16 +6,17 @@ System catalog module — manages the database's internal metadata.
 
 | File           | Purpose                                                    |
 |----------------|------------------------------------------------------------|
-| `types.rs`     | Struct definitions: `Tablespace`, `Schema`, `Table`, `Column`, `BufferPool`, `Catalog` |
-| `row.rs`       | `RowReader` / `RowWriter` — binary serialization using u64 LE length-prefixed fields |
+| `mod.rs`       | Module root; exports `SYSTEM_SCHEMA` constant (`RQSYS`) for file-path / catalog-key construction |
+| `types.rs`     | Struct definitions: `Tablespace`, `Schema` (with `system` flag), `Table`, `Column`, `BufferPool`, `Catalog`; SQL type-system limits (`MIN_CHAR_LENGTH`, `MAX_CHAR_LENGTH`) |
+| `row.rs`       | `RowReader` / `RowWriter` — binary serialization using u64 LE length-prefixed fields; row-format constants (`LENGTH_PREFIX_SIZE`, `MIN_COLUMN_BYTES`) |
 | `config.rs`    | `DbConfig` — reads/writes the `admin/SQLDBCONF` database configuration file |
 | `bootstrap.rs` | Creates a fresh database directory with `SQLDBCONF` and system catalog `.DAT` files |
 | `loader.rs`    | Reads `.DAT` files from disk and deserializes them into `Catalog` |
-| `cache.rs`     | `CatalogCache` — permanent in-memory cache with O(1) HashMap lookups for tables, columns, tablespaces |
+| `cache.rs`     | `CatalogCache` — permanent in-memory cache with O(1) HashMap lookups; holds `DbConfig` for runtime access |
 
 ## How It Works
 
-1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the five system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`, `SYSBUFFERPOOLS`) into `systbsp/` as `.DAT` files. In binary mode (default), each `.DAT` file is a **slotted-page heap file** written via `HeapFile`, with a companion `.FSM` free-space map. In text mode, files are flat TSV.
+1. **Bootstrap** (`bootstrap.rs`) writes `admin/SQLDBCONF` and the five system tables (`SYSTABLESPACES`, `SYSSCHEMAS`, `SYSTABLES`, `SYSCOLUMNS`, `SYSBUFFERPOOLS`) into `systbsp/` as `.DAT` files. In binary mode (default), each `.DAT` file is a **slotted-page heap file** written via `HeapFile`, with a companion `.FSM` free-space map. In text mode, files are flat TSV.  Bootstrap also creates two schemas: `RQSYS` (system catalog) and `PUBLIC` (default user schema).
 2. **Config** (`config.rs`) reads `SQLDBCONF` on subsequent startups so the engine knows the database's settings.
 3. **Loader** (`loader.rs`) reads those `.DAT` files back. In binary mode, it opens each file as a `HeapFile` and calls `scan()` to extract rows from slotted pages. Each row is then deserialized with `RowReader`. In text mode, it parses TSV lines.
 4. **Cache** (`cache.rs`) wraps the loaded `Catalog` in a `CatalogCache` that stays resident for the lifetime of the database.  It pre-materializes all catalog rows as `Vec<Value>` and builds `HashMap` indexes for O(1) lookup by name or ID.  The SQL executor reads exclusively from this cache — no per-query struct conversion or linear scans.
@@ -31,11 +32,13 @@ Both modes share the same per-table functions — the `text_mode` flag controls 
 
 Written at bootstrap and read on every subsequent startup. Format: `KEY = VALUE` with `--` comments.
 
-| Parameter   | Default | Description                                               |
-|-------------|---------|-----------------------------------------------------------|
-| `PAGESIZE`  | `4096`  | Default page size (bytes) for new tablespaces. Each tablespace stores its own `PAGESIZE` in `SYSTABLESPACES`. Must be a power of two ≥ 512. |
-| `DIAGLEVEL` | `INFO`  | Diagnostic verbosity: `OFF`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. |
-| `TEXT_MODE`  | `FALSE` | `TRUE` = TSV text `.DAT` files, `FALSE` = binary.         |
+| Parameter   | Default    | Description                                               |
+|-------------|------------|------------------------------------------------------------|
+| `PAGESIZE`  | `4096`     | Default page size (bytes) for new tablespaces. Each tablespace stores its own `PAGESIZE` in `SYSTABLESPACES`. Must be a power of two ≥ 512. |
+| `DIAGLEVEL` | `INFO`     | Diagnostic verbosity: `OFF`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. |
+| `TEXT_MODE`  | `FALSE`   | `TRUE` = TSV text `.DAT` files, `FALSE` = binary.         |
+| `DFT_SCHEMA` | `PUBLIC`  | Default schema for unqualified table names (DB2: `DFT_SCHEMA`). |
+| `DFT_TBSP`  | `USERTBSP` | Default tablespace for user-created tables (DB2: `DFT_TBSP`). Resolved to tablespace ID via catalog at runtime. |
 
 ## Data Representations
 
@@ -71,6 +74,17 @@ Specifies what kind of data can be stored in the tablespace.
 |------|----------------|
 | `Y`  | Nullable       |
 | `N`  | Not nullable   |
+
+### SYSSCHEMAS.SYSTEMFLAG
+
+Flags whether a schema is a system schema. System schemas are protected
+from user DDL (e.g., `CREATE TABLE RQSYS.foo` is rejected) and are
+automatically appended to the search path after the default schema.
+
+| Code | Meaning        |
+|------|----------------|
+| `Y`  | System schema  |
+| `N`  | User schema    |
 
 ### SYSTABLESPACES.BUFFERPOOLID
 
@@ -117,15 +131,16 @@ stays permanently resident in memory. It serves two purposes:
 ### Architecture
 
 ```
-load_catalog()          CatalogCache::new(catalog)
+load_catalog()          CatalogCache::new(catalog, config)
      │                           │
      ▼                           ▼
   Catalog ─────────────► CatalogCache
   (Vec<Table>,            ├─ catalog: Catalog           (typed access)
-   Vec<Column>,           ├─ tables_data: HashMap       (schema,table) → CachedTable
-   Vec<Tablespace>,       ├─ table_idx: HashMap         (schema,table) → index
-   Vec<Schema>,           ├─ tablespace_by_id: HashMap  tbspaceid → index
-   Vec<BufferPool>)       ├─ schema_idx: HashMap        schema name → index
+   Vec<Column>,           ├─ config: DbConfig           (SQLDBCONF parameters)
+   Vec<Tablespace>,       ├─ tables_data: HashMap       (schema,table) → CachedTable
+   Vec<Schema>,           ├─ table_idx: HashMap         (schema,table) → index
+   Vec<BufferPool>)       ├─ tablespace_by_id: HashMap  tbspaceid → index
+                          ├─ schema_idx: HashMap        schema name → index
                           ├─ columns_by_table: HashMap  (schema,table) → sorted cols
                           └─ column_meta: HashMap       (schema,table) → (names, name→index)
 ```
@@ -149,6 +164,13 @@ Each catalog table is pre-materialized into a `CachedTable`:
 | `get_column_meta(schema, table)` | `Option<(&[String], &HashMap<String, usize>)>` | (schema, table) — precomputed column names + name→index map |
 | `get_tablespace_by_id(id)` | `Option<&Tablespace>` | tbspaceid |
 | `get_table_data(schema, table)` | `Option<&CachedTable>` | (schema, table) |
+| `has_schema(name)` | `bool` | schema name |
+| `is_system_schema(name)` | `bool` | schema name — checks SYSTEMFLAG |
+| `system_schema_names()` | `Vec<&str>` | all schemas with SYSTEMFLAG='Y' |
+| `config()` | `&DbConfig` | Access SQLDBCONF parameters |
+| `default_tablespace_id()` | `i16` | Resolves `DFT_TBSP` config name to tablespace ID |
+| `register_schema(schema)` | `()` | Adds a new schema; re-materializes SYSSCHEMAS |
+| `register_table(table, columns)` | `()` | Adds a new table + columns; re-materializes SYSTABLES/SYSCOLUMNS |
 
 ### Before vs After
 
@@ -228,7 +250,8 @@ the executor checks the zone map to skip pages whose range doesn't overlap.
 **When to revisit the full-preload decision:**
 
 - **100K+ tables** where memory cost is no longer negligible → add LRU eviction.
-- **Concurrent DDL** (`CREATE TABLE`, `ALTER TABLE`) → add entry-level cache mutation.
+- **Concurrent DDL** (`CREATE TABLE`, `ALTER TABLE`) → add latch-protected entry-level cache mutation.
+  (`register_table()` / `register_schema()` already mutate the cache inline.)
 - **Phase 5** (migrate catalog to slotted pages) will naturally move catalog data
   into the buffer pool, aligning with DB2/PostgreSQL architecture.
 

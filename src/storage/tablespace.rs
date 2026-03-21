@@ -37,6 +37,12 @@ pub struct TablespaceManager {
     pool_manager: BufferPoolManager,
     /// (SCHEMA, TABLE) → file routing info.
     table_files: HashMap<(String, String), TableFileInfo>,
+    /// Root database directory.
+    data_dir: PathBuf,
+    /// tbspaceid → directory path.
+    ts_dirs: HashMap<i32, PathBuf>,
+    /// tbspaceid → (bufferpoolid, pagesize).
+    ts_pool: HashMap<i32, (BufferPoolId, usize)>,
 }
 
 impl TablespaceManager {
@@ -56,10 +62,12 @@ impl TablespaceManager {
             )?;
         }
 
-        // 2. Map tbspaceid → directory.
+        // 2. Map tbspaceid → directory and tbspaceid → bufferpoolid.
         let mut ts_dirs: HashMap<i32, std::path::PathBuf> = HashMap::new();
+        let mut ts_pool: HashMap<i32, (BufferPoolId, usize)> = HashMap::new();
         for ts in &catalog.tablespaces {
             ts_dirs.insert(ts.tbspaceid, data_dir.join(ts.tbspace.to_lowercase()));
+            ts_pool.insert(ts.tbspaceid, (ts.bufferpoolid, ts.pagesize as usize));
         }
 
         // 3. Register each table's DAT file with its tablespace's buffer pool.
@@ -117,6 +125,9 @@ impl TablespaceManager {
         Ok(Self {
             pool_manager,
             table_files,
+            data_dir: data_dir.to_path_buf(),
+            ts_dirs,
+            ts_pool,
         })
     }
 
@@ -364,6 +375,40 @@ impl TablespaceManager {
         Ok(())
     }
 
+    /// Register a newly-created table. Creates the `.DAT` file (empty heap)
+    /// and maps `(schema, table)` so subsequent DML calls work immediately.
+    pub fn register_new_table(
+        &mut self,
+        schema: &str,
+        table: &str,
+        tbspaceid: i32,
+    ) -> Result<()> {
+        let dir = self.ts_dirs.get(&tbspaceid).ok_or_else(|| {
+            Error::Catalog(format!("no directory for tablespace id {tbspaceid}"))
+        })?;
+        let dat_path = dir.join(format!("{schema}.{table}.0.DAT"));
+        let fsm_path = dat_path.with_extension("FSM");
+
+        let &(pool_id, page_size) = self.ts_pool.get(&tbspaceid).ok_or_else(|| {
+            Error::Catalog(format!("no buffer pool mapping for tablespace id {tbspaceid}"))
+        })?;
+
+        let file_id = self.pool_manager.register_file(pool_id, &dat_path, page_size)?;
+
+        self.table_files.insert(
+            (schema.to_string(), table.to_string()),
+            TableFileInfo {
+                pool_id,
+                file_id,
+                fsm: FreeSpaceMap::new(0, page_size),
+                fsm_path,
+            },
+        );
+
+        log::info!("registered new table {schema}.{table} in tablespace {tbspaceid}");
+        Ok(())
+    }
+
     /// Shared reference to the pool manager.
     pub fn pool_manager(&self) -> &BufferPoolManager {
         &self.pool_manager
@@ -434,6 +479,9 @@ mod tests {
         let tsm = TablespaceManager {
             pool_manager,
             table_files,
+            data_dir: dir.path.clone(),
+            ts_dirs: HashMap::new(),
+            ts_pool: HashMap::new(),
         };
         (dir, tsm)
     }
@@ -534,6 +582,9 @@ mod tests {
             let mut tsm = TablespaceManager {
                 pool_manager,
                 table_files,
+                data_dir: dir.path.clone(),
+                ts_dirs: HashMap::new(),
+                ts_pool: HashMap::new(),
             };
             rid = tsm
                 .insert_row("TEST", "PERSIST", b"survive-restart")
@@ -564,6 +615,9 @@ mod tests {
             let mut tsm = TablespaceManager {
                 pool_manager,
                 table_files,
+                data_dir: dir.path.clone(),
+                ts_dirs: HashMap::new(),
+                ts_pool: HashMap::new(),
             };
             let data = tsm.read_row("TEST", "PERSIST", rid).unwrap();
             assert_eq!(data, b"survive-restart");
@@ -584,7 +638,7 @@ mod tests {
         crate::catalog::bootstrap::bootstrap(&dir.path, &cfg).unwrap();
         let catalog =
             crate::catalog::loader::load_catalog(&dir.path, false, cfg.page_size).unwrap();
-        let cache = crate::catalog::cache::CatalogCache::new(catalog);
+        let cache = crate::catalog::cache::CatalogCache::new(catalog, cfg);
 
         let tsm = TablespaceManager::open(&dir.path, &cache).unwrap();
 

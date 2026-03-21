@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::catalog::config::DbConfig;
 use crate::catalog::types::*;
 use crate::sql::types::Value;
 
@@ -21,6 +22,8 @@ pub struct CachedTable {
 pub struct CatalogCache {
     /// The underlying typed catalog (for direct struct access).
     catalog: Catalog,
+    /// Database configuration (SQLDBCONF).
+    config: DbConfig,
     /// (SCHEMA, TABLE_NAME) → pre-materialized table data. O(1) lookup.
     tables_data: HashMap<(String, String), CachedTable>,
     /// (SCHEMA, TABLE_NAME) → index into `catalog.tables`.
@@ -38,7 +41,7 @@ pub struct CatalogCache {
 impl CatalogCache {
     /// Build the cache from a loaded catalog. Indexes and pre-materializes
     /// all catalog data for O(1) access.
-    pub fn new(catalog: Catalog) -> Self {
+    pub fn new(catalog: Catalog, config: DbConfig) -> Self {
         let table_idx: HashMap<(String, String), usize> = catalog
             .tables
             .iter()
@@ -87,6 +90,7 @@ impl CatalogCache {
 
         Self {
             catalog,
+            config,
             tables_data,
             table_idx,
             tablespace_by_id,
@@ -101,6 +105,22 @@ impl CatalogCache {
         self.table_idx
             .get(&(schema.to_string(), name.to_string()))
             .map(|&i| &self.catalog.tables[i])
+    }
+
+    /// Database configuration (SQLDBCONF).
+    pub fn config(&self) -> &DbConfig {
+        &self.config
+    }
+
+    /// Resolve the default tablespace name to its ID.
+    /// Falls back to ID 2 (USERTBSP) if the configured name is not found.
+    pub fn default_tablespace_id(&self) -> i16 {
+        self.catalog
+            .tablespaces
+            .iter()
+            .find(|ts| ts.tbspace == self.config.default_tablespace)
+            .map(|ts| ts.tbspaceid as i16)
+            .unwrap_or(2)
     }
 
     /// O(1) columns for a table, sorted by ordinal.
@@ -139,10 +159,79 @@ impl CatalogCache {
         &self.catalog
     }
 
+    /// Check whether a schema exists.
+    pub fn has_schema(&self, name: &str) -> bool {
+        self.schema_idx.contains_key(name)
+    }
+
+    /// Check whether a schema is a system schema (via SYSTEMFLAG).
+    pub fn is_system_schema(&self, name: &str) -> bool {
+        self.schema_idx
+            .get(name)
+            .map(|&i| self.catalog.schemas[i].system)
+            .unwrap_or(false)
+    }
+
+    /// Return the names of all system schemas (SYSTEMFLAG = 'Y').
+    pub fn system_schema_names(&self) -> Vec<&str> {
+        self.catalog
+            .schemas
+            .iter()
+            .filter(|s| s.system)
+            .map(|s| s.name.as_str())
+            .collect()
+    }
+
+    /// Register a new schema in the cache (after persisting to SYSSCHEMAS).
+    pub fn register_schema(&mut self, schema: Schema) {
+        let idx = self.catalog.schemas.len();
+        self.schema_idx.insert(schema.name.clone(), idx);
+        self.catalog.schemas.push(schema);
+        // Re-materialize SYSSCHEMAS.
+        self.tables_data.insert(
+            (super::SYSTEM_SCHEMA.into(), "SYSSCHEMAS".into()),
+            Self::materialize_sysschemas(&self.catalog),
+        );
+    }
+
+    /// Register a newly-created table and its columns in the cache.
+    ///
+    /// Call this **after** the catalog rows have been persisted to
+    /// SYSTABLES / SYSCOLUMNS via the tablespace manager.
+    pub fn register_table(&mut self, table: Table, columns: Vec<Column>) {
+        let key = (table.schemaname.clone(), table.name.clone());
+
+        // catalog.tables
+        let idx = self.catalog.tables.len();
+        self.table_idx.insert(key.clone(), idx);
+        self.catalog.tables.push(table);
+
+        // columns_by_table  (already sorted by caller)
+        self.columns_by_table.insert(key.clone(), columns.clone());
+
+        // column_meta
+        let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let index = Self::build_column_index(&names);
+        self.column_meta.insert(key.clone(), (names, index));
+
+        // catalog.columns
+        self.catalog.columns.extend(columns);
+
+        // Re-materialize SYSTABLES and SYSCOLUMNS so SELECTs see them.
+        self.tables_data.insert(
+            (super::SYSTEM_SCHEMA.into(), "SYSTABLES".into()),
+            Self::materialize_systables(&self.catalog),
+        );
+        self.tables_data.insert(
+            (super::SYSTEM_SCHEMA.into(), "SYSCOLUMNS".into()),
+            Self::materialize_syscolumns(&self.catalog),
+        );
+    }
+
     // ── Internal: pre-materialize all catalog tables ──
 
     fn materialize_tables(catalog: &Catalog) -> HashMap<(String, String), CachedTable> {
-        let schema = "RQSYS".to_string();
+        let schema = super::SYSTEM_SCHEMA.to_string();
         let mut map = HashMap::new();
 
         // SYSTABLESPACES
@@ -202,9 +291,10 @@ impl CatalogCache {
     }
 
     fn materialize_sysschemas(catalog: &Catalog) -> CachedTable {
-        let column_names: Vec<String> = vec!["NAME".into()];
+        let column_names: Vec<String> = vec!["NAME".into(), "SYSTEMFLAG".into()];
         let rows = catalog.schemas.iter().map(|s| vec![
             Value::Str(s.name.clone()),
+            Value::Bool(s.system),
         ]).collect();
         let column_index = Self::build_column_index(&column_names);
         CachedTable { column_names, column_index, rows }
@@ -284,7 +374,7 @@ mod tests {
                     bufferpoolid: 1,
                 },
             ],
-            schemas: vec![Schema { name: "RQSYS".into() }],
+            schemas: vec![Schema { name: "RQSYS".into(), system: true }],
             tables: vec![
                 Table {
                     name: "SYSTABLESPACES".into(),
@@ -338,7 +428,7 @@ mod tests {
 
     #[test]
     fn lookup_table_by_name() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         let t = cache.get_table("RQSYS", "SYSTABLESPACES").unwrap();
         assert_eq!(t.name, "SYSTABLESPACES");
         assert_eq!(t.colcount, 7);
@@ -347,7 +437,7 @@ mod tests {
 
     #[test]
     fn lookup_tablespace_by_id() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         let ts = cache.get_tablespace_by_id(1).unwrap();
         assert_eq!(ts.tbspace, "SYSTBSP");
         let ts2 = cache.get_tablespace_by_id(2).unwrap();
@@ -357,7 +447,7 @@ mod tests {
 
     #[test]
     fn lookup_columns_sorted() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         let cols = cache.get_columns("RQSYS", "SYSTABLESPACES").unwrap();
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].name, "TBSPACEID");
@@ -368,7 +458,7 @@ mod tests {
 
     #[test]
     fn cached_table_data_matches() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         let ct = cache.get_table_data("RQSYS", "SYSTABLESPACES").unwrap();
         assert_eq!(ct.column_names.len(), 7);
         assert_eq!(ct.rows.len(), 2);
@@ -379,13 +469,13 @@ mod tests {
 
     #[test]
     fn cached_table_not_found() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         assert!(cache.get_table_data("RQSYS", "NONEXISTENT").is_none());
     }
 
     #[test]
     fn schema_lookup() {
-        let cache = CatalogCache::new(test_catalog());
+        let cache = CatalogCache::new(test_catalog(), DbConfig::default());
         assert!(cache.schema_idx.contains_key("RQSYS"));
         assert!(!cache.schema_idx.contains_key("BOGUS"));
     }

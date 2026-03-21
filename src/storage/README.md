@@ -639,6 +639,7 @@ SQL Executor / Catalog
 | `read_row` | `(&mut self, schema, table, Rid) -> Result<Vec<u8>>` | Read one row by RID |
 | `delete_row` | `(&mut self, schema, table, Rid) -> Result<bool>` | Tombstone a row |
 | `update_row` | `(&mut self, schema, table, Rid, &[u8]) -> Result<UpdateRowResult>` | In-place update or row migration |
+| `register_new_table` | `(&mut self, schema, table, tbspaceid) -> Result<()>` | Create .DAT file + register for a newly-created table |
 | `flush_all` | `(&mut self) -> Result<()>` | Flush all dirty pages in all pools + persist FSMs |
 | `pool_manager` | `(&self) -> &BufferPoolManager` | Read-only access for diagnostics |
 
@@ -759,10 +760,13 @@ pre-materialized `CachedTable` rows:
 - **UPDATE:** `table_scan()` + WHERE filter → in-place `update_row()` by
   RID with automatic row migration fallback when the row outgrows its slot
 - **DELETE:** `table_scan()` + WHERE filter → `delete_row()` by RID
+- **CREATE TABLE:** `register_new_table()` creates an empty `.DAT` file in
+  the target tablespace directory and maps it to the buffer pool so
+  subsequent DML works immediately
 
-This makes SELECT, INSERT, and DELETE work against any table — catalog or
-user — without per-table match arms. Column typename drives serialization
-(SMALLINT→i16, INTEGER→i32, CHAR/VARCHAR→string).
+This makes SELECT, INSERT, DELETE, UPDATE, and CREATE TABLE work against any
+table — catalog or user — without per-table match arms. Column typename drives
+serialization (SMALLINT→i16, INTEGER→i32, CHAR/VARCHAR→string).
 
 ## Dependency Order
 
