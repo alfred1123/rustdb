@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn save_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join("rustdb_fsm_roundtrip");
+        let dir = std::env::temp_dir().join("rqdb_fsm_roundtrip");
         let _ = std::fs::create_dir_all(&dir);
         let fsm_path = dir.join("TEST.FSM");
 
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn load_nonexistent_returns_none() {
-        let path = std::env::temp_dir().join("rustdb_fsm_no_such_file.FSM");
+        let path = std::env::temp_dir().join("rqdb_fsm_no_such_file.FSM");
         let _ = std::fs::remove_file(&path);
         let result = FreeSpaceMap::load(&path).unwrap();
         assert!(result.is_none());

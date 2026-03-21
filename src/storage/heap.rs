@@ -269,7 +269,7 @@ mod tests {
 
     impl TempFile {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("rustdb_test_{name}"));
+            let path = std::env::temp_dir().join(format!("rqdb_test_{name}"));
             // Remove if leftover from a previous run.
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(fsm_path_for(&path));

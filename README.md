@@ -1,4 +1,4 @@
-# RustDB
+# RQDB
 
 A transactional relational database engine written from scratch in Rust,
 following IBM DB2-style catalog and tablespace conventions and ANSI SQL
@@ -8,7 +8,7 @@ standards.
 UPDATE, DELETE, and SELECT all work with WHERE filtering. Data persists across
 restarts. Transactions and networking are in progress.
 
-## Why RustDB?
+## Why RQDB?
 
 ### What It Does Well Today
 
@@ -35,12 +35,15 @@ restarts. Transactions and networking are in progress.
   schema-prefixed table references.
 - **Data persistence.** All data is flushed to `.DAT` heap files on
   shutdown and reloaded on startup — user tables survive restarts.
+- **Safe database management.** `CONNECT TO` and `CREATE DATABASE` commands
+  prevent accidental data loss — connecting requires an existing database,
+  creating requires a non-existent one.
 - **Interactive SQL REPL** with immediate feedback and SQLSTATE error codes.
 
 ### Comparison with Other Databases
 
-| Feature | RustDB | SQLite | PostgreSQL | DuckDB |
-|---------|--------|--------|------------|--------|
+| Feature | RQDB | SQLite | PostgreSQL | DuckDB |
+|---------|------|--------|------------|--------|
 | **Language** | Rust (memory-safe) | C | C | C++ |
 | **Storage model** | Slotted pages + buffer pool | B-tree pages | Slotted pages + buffer pool | Column-oriented |
 | **Free-space tracking** | Binary max-heap FSM — O(log P) | B-tree internal | Per-page FSM — O(1) amortized | N/A (append-only) |
@@ -53,7 +56,7 @@ restarts. Transactions and networking are in progress.
 | **Transactions** | Planned (ARIES-style WAL) | WAL or journal | WAL + MVCC | WAL |
 | **Codebase size** | ~3K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
-### When to Consider RustDB
+### When to Consider RQDB
 
 - **Learning database internals.** The codebase is small and well-documented.
   Each module (`page.rs`, `heap.rs`, `pool.rs`, `fsm.rs`, `tablespace.rs`)
@@ -65,7 +68,7 @@ restarts. Transactions and networking are in progress.
   to experiment with new page formats, eviction policies, or index structures
   without touching unrelated code.
 
-### When Not to Use RustDB (Yet)
+### When Not to Use RQDB (Yet)
 
 - **Production workloads.** No WAL, no crash recovery, no transactions yet.
 - **Multi-user access.** Single-session only — no TCP server or connection
@@ -105,67 +108,117 @@ restarts. Transactions and networking are in progress.
 ## Project Structure
 
 ```
-rustdb/
+rqdb/
 ├── src/
-│   ├── main.rs               # Entry point — CLI bootstrap + SQL REPL
+│   ├── main.rs               # Entry point — CLI + SQL REPL
+│   ├── db.rs                 # Database lifecycle (open_database, create_database)
 │   ├── error.rs              # Error types (thiserror)
 │   ├── catalog/              # System catalog, bootstrap, loader, cache
 │   ├── storage/              # Slotted pages, heap files, FSM, buffer pool, tablespace manager
 │   ├── sql/                  # SQL parser + executor (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE)
 │   ├── transaction/          # WAL, concurrency, recovery (planned)
 │   └── server/               # TCP listener, wire protocol (planned)
-├── data/TESTDB/              # Default database instance directory
+├── data/                     # Database instances (e.g. data/MYDB/)
 ├── Cargo.toml
 └── README.md
 ```
 
 ## Quick Start
 
+### Installation
+
 ```sh
-# Build
+# Build from source
 cargo build
 
-# Run tests (126 tests)
-cargo test
+# Install the rqdb binary (places it in ~/.cargo/bin/)
+cargo install --path .
 
-# Bootstrap and start with a new database
-cargo run -- --data-dir ./data/MYDB
+# Verify it works
+rqdb --help
+```
 
-# Use existing database directory
-cargo run -- --data-dir ./data/TESTDB
+> **Note:** `~/.cargo/bin` must be on your PATH. This is set up automatically by
+> `rustup`. If `rqdb: command not found` after install, run:
+> ```sh
+> echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
+> source ~/.bashrc
+> ```
+
+### Running
+
+```sh
+# Start the REPL (no database connected)
+rqdb
+
+# Create a new database and connect
+rqdb create database MYDB
+
+# Connect to an existing database
+rqdb connect to MYDB
+
+# Override the base directory for databases (default: ./data)
+rqdb --data-dir /tmp connect to MYDB
 
 # Text mode — writes human-readable TSV instead of binary (for debugging)
-cargo run -- --data-dir ./data/DEBUGDB --text-mode
+rqdb --text-mode create database DEBUGDB
 
 # Verbose logging (debug level)
-RUST_LOG=debug cargo run -- --data-dir ./data/MYDB
+RUST_LOG=debug rqdb connect to MYDB
+
+# Run tests (130+ tests)
+cargo test
+```
+
+You can also use `cargo run --` instead of `rqdb` without installing:
+
+```sh
+cargo run -- connect to MYDB
 ```
 
 ### Sample Session
 
+```
+$ rqdb
+RQDB — interactive SQL shell
+Type SQL queries, CONNECT TO <db>, CREATE DATABASE <db>, DISCONNECT, or \q to quit.
+
+rqdb> CREATE DATABASE MYDB
+Database MYDB created.
+
+rqdb:MYDB> CREATE TABLE employees (id INTEGER NOT NULL, name VARCHAR(50), dept VARCHAR(30))
+
+rqdb:MYDB> INSERT INTO employees VALUES (1, 'Alice', 'Engineering')
+rqdb:MYDB> INSERT INTO employees VALUES (2, 'Bob', 'Marketing'), (3, 'Carol', 'Engineering')
+
+rqdb:MYDB> SELECT name, dept FROM employees WHERE dept = 'Engineering'
+
+rqdb:MYDB> UPDATE employees SET dept = 'Sales' WHERE id = 2
+
+rqdb:MYDB> DELETE FROM employees WHERE id = 3
+
+rqdb:MYDB> CONNECT TO OTHERDB
+Connected to OTHERDB.
+
+rqdb:OTHERDB> DISCONNECT
+Disconnected from OTHERDB.
+
+rqdb> \q
+```
+
+### Database Management Commands
+
+| Command | CLI | REPL | Description |
+|---------|:---:|:----:|-------------|
+| `CONNECT TO <DBNAME>` | yes | yes | Connect to an existing database (error if not found) |
+| `CREATE DATABASE <DBNAME>` | yes | yes | Create a new database and connect to it (error if exists) |
+| `DISCONNECT` | — | yes | Flush and disconnect from the current database |
+
+Database paths resolve to `<data-dir>/<DBNAME>` (default: `./data/<DBNAME>`).
+
+### System Catalog Queries
+
 ```sql
--- Create a table
-CREATE TABLE employees (id INTEGER NOT NULL, name VARCHAR(50), dept VARCHAR(30))
-
--- Insert rows
-INSERT INTO employees VALUES (1, 'Alice', 'Engineering')
-INSERT INTO employees VALUES (2, 'Bob', 'Marketing'), (3, 'Carol', 'Engineering')
-
--- Query with filtering
-SELECT name, dept FROM employees WHERE dept = 'Engineering'
-
--- Update rows
-UPDATE employees SET dept = 'Sales' WHERE id = 2
-
--- Delete rows
-DELETE FROM employees WHERE id = 3
-
--- Schema-qualified tables
-CREATE TABLE myapp.products (sku INTEGER NOT NULL, label VARCHAR(80))
-INSERT INTO myapp.products VALUES (100, 'Widget')
-SELECT * FROM myapp.products
-
--- Inspect the system catalog
 SELECT * FROM RQSYS.SYSTABLES
 SELECT NAME, TYPENAME, NULLABLE FROM RQSYS.SYSCOLUMNS WHERE TABNAME = 'EMPLOYEES'
 SELECT TBSPACE, PAGESIZE, TBSPACETYPE FROM RQSYS.SYSTABLESPACES
@@ -174,7 +227,7 @@ SELECT * FROM RQSYS.SYSBUFFERPOOLS
 
 ## System Catalog
 
-RustDB stores metadata in five system tables under the `RQSYS` schema:
+RQDB stores metadata in five system tables under the `RQSYS` schema:
 
 | Table              | Purpose                            |
 |--------------------|------------------------------------|
@@ -231,6 +284,7 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 - [x] CREATE TABLE (DDL) with auto-schema creation and catalog registration
 - [x] Data persistence across restart (flush + reload)
 - [x] SQLSTATE error codes for all SQL errors
+- [x] CONNECT TO / CREATE DATABASE / DISCONNECT (safe database management)
 - [ ] DROP TABLE (DDL)
 - [ ] Write-ahead log (WAL) with ARIES-style recovery
 - [ ] MVCC or lock-based concurrency control

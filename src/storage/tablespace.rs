@@ -439,7 +439,7 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("rustdb_tsm_{name}"));
+            let path = std::env::temp_dir().join(format!("rqdb_tsm_{name}"));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             Self { path }

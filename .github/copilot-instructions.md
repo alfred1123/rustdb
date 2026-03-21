@@ -1,17 +1,17 @@
-# RustDB — Copilot Instructions
+# RQDB — Copilot Instructions
 
 ## Project Overview
 
-RustDB is a transactional relational database engine written from scratch in Rust.
+RQDB is a transactional relational database engine written from scratch in Rust.
 It follows IBM DB2-style catalog and tablespace conventions.
-RustDB shall follow the **ANSI SQL** industry standard for SQL syntax, semantics, and data types.
+RQDB shall follow the **ANSI SQL** industry standard for SQL syntax, semantics, and data types.
 
 **Schema prefix:** `RQSYS` (system catalog schema)
 
 ## Directory Layout
 
 ```
-rustdb/
+rqdb/
 ├── .github/                  # CI and Copilot configuration
 ├── src/
 │   ├── main.rs               # Entry point — CLI / server bootstrap

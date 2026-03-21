@@ -325,7 +325,7 @@ Industry databases (PostgreSQL, MySQL/InnoDB, IBM DB2) achieve dramatically
 better performance through indexes, in-place updates, and query planning.
 Below is a side-by-side comparison:
 
-| Aspect | RustDB (current) | Industry Standard (PostgreSQL, DB2, etc.) |
+| Aspect | RQDB (current) | Industry Standard (PostgreSQL, DB2, etc.) |
 |--------|-------------------|-------------------------------------------|
 | **SELECT with WHERE** | O(N) — full table scan, no indexes | O(log N) with B-tree index; O(1) with hash index |
 | **INSERT** | O(log P) — FSM-based page search | O(log N) per index — similar base cost, but each index adds O(log N) for key insertion |
@@ -436,7 +436,7 @@ To be usable as a general-purpose SQL engine:
 
 ### Maturity Scale
 
-| Level | Description | RustDB Status |
+| Level | Description | RQDB Status |
 |-------|-------------|---------------|
 | 1. Storage | Page-based heap storage with buffer pool | ✅ Complete |
 | 2. Catalog | Self-describing system catalog | ✅ Complete |
@@ -449,6 +449,6 @@ To be usable as a general-purpose SQL engine:
 | 9. Advanced SQL | JOINs, aggregates, subqueries, ORDER BY | ❌ Not started |
 | 10. Production | Connection pooling, auth, replication | ❌ Not started |
 
-RustDB is at **Level 3** — functional single-table DML with a solid storage
+RQDB is at **Level 3** — functional single-table DML with a solid storage
 foundation. The next major milestone is **Level 4 (B-tree indexes)**, which
 would close the biggest performance gap versus industry databases.

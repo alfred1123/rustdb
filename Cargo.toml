@@ -1,7 +1,11 @@
 [package]
-name = "rustdb"
+name = "rqdb"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "rqdb"
+path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"

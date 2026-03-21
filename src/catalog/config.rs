@@ -194,7 +194,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("rustdb_test").join(name);
+        let dir = std::env::temp_dir().join("rqdb_test").join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("admin")).unwrap();
         dir

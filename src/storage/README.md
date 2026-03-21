@@ -867,7 +867,7 @@ buffer pool's `shared_buffers`) and DB2's catalog cache (separate from
 | `CREATE TABLESPACE` | Insert into `SYSTABLESPACES` on disk, add to routing cache |
 | Buffer pool eviction | No cache impact — cache is separate from page frames |
 
-Because RustDB is currently single-session, there is no cross-session
+Because RQDB is currently single-session, there is no cross-session
 invalidation concern.
 
 **No eviction required.** The cache holds only catalog metadata (never user
@@ -902,7 +902,7 @@ SQL executor / planner
 
 ## Future Development Options
 
-RustDB follows DB2-style conventions. The table below compares the current
+RQDB follows DB2-style conventions. The table below compares the current
 approach with Oracle-style alternatives that could be adopted if workload
 demands justify the added complexity.
 
@@ -920,14 +920,14 @@ better memory utilisation.
 
 ### Eviction Policy: LRU vs Alternative Mechanisms
 
-RustDB currently uses strict LRU via `VecDeque<FrameIndex>`. LRU is the
+RQDB currently uses strict LRU via `VecDeque<FrameIndex>`. LRU is the
 industry-standard default, but production databases adapt it to specific
 workload patterns. The table below compares alternatives that could be
 adopted if profiling reveals LRU limitations.
 
 | Mechanism | Used By | Situation | Why Used |
 |-----------|---------|-----------|----------|
-| **Strict LRU** | SQLite, RustDB (current) | Small to medium pools, embedded databases | Simplest to implement; good default for general workloads |
+| **Strict LRU** | SQLite, RQDB (current) | Small to medium pools, embedded databases | Simplest to implement; good default for general workloads |
 | **CLOCK (circular LRU)** | PostgreSQL | Large buffer pools with high throughput | Approximates LRU with O(1) eviction — avoids moving entries in a linked list on every access; uses a reference bit swept by a clock hand |
 | **LRU-K** | Microsoft SQL Server | Mixed OLTP/OLAP with repeated sequential scans | Tracks the last K accesses per page; a single sequential scan doesn't pollute the cache because pages need multiple hits to become "hot" |
 | **Midpoint Insertion (Young/Old LRU)** | MySQL InnoDB | Full-table scans mixed with point lookups | New pages enter at the midpoint (3/8 from tail); only pages re-accessed after a configurable interval promote to the "young" head — prevents scan floods from evicting hot pages |
@@ -937,7 +937,7 @@ adopted if profiling reveals LRU limitations.
 | **ARC (Adaptive Replacement Cache)** | ZFS, IBM DS8000 | Workloads that shift between recency-friendly and frequency-friendly patterns | Self-tuning hybrid of LRU and LFU; dynamically adjusts the split between recent-once and recent-many lists without manual configuration |
 | **2Q (Two-Queue)** | Research, some storage engines | Scan-resistant caching with minimal tuning | Incoming pages go to a short FIFO queue; only pages re-accessed within the FIFO window promote to a main LRU queue — cheap scan resistance |
 
-**Potential upgrade path for RustDB:**
+**Potential upgrade path for RQDB:**
 
 1. **Near-term — CLOCK sweep.** Replace the `VecDeque` LRU with a circular
    buffer + reference bit. This eliminates the O(n) `retain()` calls on
@@ -1006,7 +1006,7 @@ datafiles per tablespace, which is not currently in scope.
 | **Pro** | One log, one recovery algorithm; well-studied with clear correctness proofs | Undo segments provide read consistency for free; redo log can be smaller |
 | **Con** | WAL grows larger under long-running transactions; read-consistent snapshots need a separate version store | Two subsystems to size and manage; `ORA-01555: snapshot too old` when undo undersized |
 
-**Current assessment:** ARIES is the right foundation — it gets RustDB to
+**Current assessment:** ARIES is the right foundation — it gets RQDB to
 correct ACID transactions with minimal code. If high-concurrency OLTP demands
 it later, a version store layered alongside the WAL can provide Oracle-style
 read consistency without abandoning the single-log model.

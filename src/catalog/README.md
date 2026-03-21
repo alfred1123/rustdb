@@ -49,7 +49,7 @@ Specifies how the tablespace storage is managed.
 
 | Code | Meaning                                                      |
 |------|--------------------------------------------------------------|
-| `D`  | **Database-managed space (DMS)** — RustDB manages files directly |
+| `D`  | **Database-managed space (DMS)** — RQDB manages files directly |
 | `S`  | **System-managed space (SMS)** — OS manages files (not used)  |
 
 ### Tablespace DATATYPE (DB2: `SYSCAT.TABLESPACES.DATATYPE`)
@@ -173,11 +173,11 @@ Each catalog table is pre-materialized into a `CachedTable`:
 
 ### Design Rationale — Industry Comparison
 
-RustDB uses **full pre-load** (SQLite-style): all catalog tables are loaded into
+RQDB uses **full pre-load** (SQLite-style): all catalog tables are loaded into
 memory at startup and kept permanently resident. Production systems like
 PostgreSQL, DB2, and Oracle use **on-demand caching** with LRU eviction instead.
 
-| Aspect | RustDB | PostgreSQL (syscache) | DB2 (catalog cache) | Oracle (row cache) |
+| Aspect | RQDB | PostgreSQL (syscache) | DB2 (catalog cache) | Oracle (row cache) |
 |--------|--------|----------------------|---------------------|--------------------|
 | Loading | All tables at startup | On-demand per-entry | On-demand | On-demand |
 | Eviction | Never | Invalidation messages | LRU (`CATALOGCACHE_SZ`) | LRU in Shared Pool |

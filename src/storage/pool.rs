@@ -506,7 +506,7 @@ mod tests {
 
     impl TempFile {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("rustdb_pool_{name}"));
+            let path = std::env::temp_dir().join(format!("rqdb_pool_{name}"));
             let _ = fs::remove_file(&path);
             Self { path }
         }
