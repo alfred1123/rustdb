@@ -51,6 +51,72 @@ SQL parser, planner, and executor.
 - System schema protection: `CREATE TABLE RQSYS.<name>` is rejected (SQLSTATE 42508).
   Unqualified names default to the configured default schema (`DFT_SCHEMA`) for DDL.
 
+### DROP TABLE
+
+`DROP TABLE <table>` reverses what CREATE TABLE does — removing catalog
+metadata, evicting cached pages, deleting data files, and updating the
+in-memory cache. `IF EXISTS` is not supported; dropping a nonexistent table
+is always an error.
+
+**Syntax:**
+
+- `DROP TABLE <table>` — drop from default schema
+- `DROP TABLE schema.table` — drop from a specific schema
+- System tables (`RQSYS.*`) are protected (SQLSTATE 42508)
+
+**Implementation — layer by layer:**
+
+```
+DROP TABLE schema.table (planned)
+  │
+  ├─ 1. Executor (executor.rs)
+  │     ├─ resolve_table_name() — same as CREATE TABLE
+  │     ├─ Guard: reject system schema (SQLSTATE 42508)
+  │     ├─ Guard: table must exist (SQLSTATE 42S02)
+  │     ├─ Scan SYSTABLES for matching (schema, name), delete row by RID
+  │     ├─ Scan SYSCOLUMNS for matching (schema, tabname), delete rows by RID
+  │     ├─ tsm.drop_table(schema, table) — remove files
+  │     └─ cache.unregister_table(schema, table) — remove from memory
+  │
+  ├─ 2. CatalogCache (catalog/cache.rs) — unregister_table()
+  │     ├─ Remove (schema, table) from table_idx
+  │     ├─ Remove from columns_by_table
+  │     ├─ Remove from column_meta
+  │     ├─ Remove matching entry from catalog.tables, rebuild table_idx
+  │     ├─ Remove matching entries from catalog.columns
+  │     └─ rematerialize("SYSTABLES") + rematerialize("SYSCOLUMNS")
+  │
+  ├─ 3. TablespaceManager (storage/tablespace.rs) — drop_table()
+  │     ├─ Remove (schema, table) from table_files
+  │     ├─ pool_manager.evict_file(file_id) — flush and discard pages
+  │     └─ std::fs::remove_file() for .DAT and .FSM files
+  │
+  └─ 4. BufferPool (storage/pool.rs) — evict_file()
+        ├─ Scan page_table for all pages belonging to file_id
+        ├─ Flush dirty pages, clear frames, remove from LRU
+        └─ Remove file from self.files registry
+```
+
+**Catalog row deletion flow:**
+
+To delete from SYSTABLES and SYSCOLUMNS, the executor scans those
+catalog tables and finds rows matching the dropped table. This uses the
+`scan_table()` method on TablespaceManager that returns `Vec<(Rid, Vec<u8>)>`
+(rows with their physical addresses), so the executor can identify which
+rows to delete via `delete_row(schema, table, rid)`.
+
+**Complexity: O(C_sys)** where C_sys is the total number of catalog rows
+(SYSTABLES + SYSCOLUMNS). This is a fixed scan of the system catalog,
+independent of the dropped table's data size. File deletion is O(1).
+
+**Integration tests:**
+
+- `drop_table_basic` — CREATE, INSERT, DROP, verify SELECT fails
+- `drop_table_nonexistent_errors` — DROP on missing table → SQLSTATE 42S02
+- `drop_table_system_table_rejected` — DROP RQSYS.SYSTABLES → SQLSTATE 42508
+- `drop_table_persists` — DROP, flush, restart, verify table is gone
+- `drop_table_then_recreate` — DROP then CREATE with same name succeeds
+
 ### Schema Resolution & Search Path
 
 - Unqualified table names default to the **configured default schema** (`DFT_SCHEMA`

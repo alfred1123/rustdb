@@ -211,6 +211,34 @@ impl CatalogCache {
         self.rematerialize("SYSCOLUMNS");
     }
 
+    /// Remove a table and its columns from the cache.
+    ///
+    /// Call this **after** the catalog rows have been deleted from
+    /// SYSTABLES / SYSCOLUMNS via the tablespace manager.
+    pub fn unregister_table(&mut self, schema: &str, table: &str) {
+        let key = (schema.to_string(), table.to_string());
+
+        self.table_idx.remove(&key);
+        self.columns_by_table.remove(&key);
+        self.column_meta.remove(&key);
+        self.tables_data.remove(&key);
+
+        self.catalog.tables.retain(|t| {
+            !(t.schemaname == schema && t.name == table)
+        });
+        self.catalog.columns.retain(|c| {
+            !(c.schemaname == schema && c.tabname == table)
+        });
+
+        // Rebuild table_idx since Vec indices shifted after retain.
+        self.table_idx = self.catalog.tables.iter().enumerate()
+            .map(|(i, t)| ((t.schemaname.clone(), t.name.clone()), i))
+            .collect();
+
+        self.rematerialize("SYSTABLES");
+        self.rematerialize("SYSCOLUMNS");
+    }
+
     // ── Internal: materialize catalog tables generically ──
 
     /// Build CachedTable entries for every table in the system schema.

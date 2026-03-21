@@ -296,6 +296,28 @@ impl BufferPool {
             .ok_or_else(|| Error::Catalog(format!("file_id {file_id} not registered")))
     }
 
+    /// Evict all pages belonging to a file from the pool, flush dirty ones
+    /// first, then remove the file registration entirely.
+    pub fn evict_file(&mut self, file_id: FileId) -> Result<()> {
+        let frame_indices: Vec<FrameIndex> = self.page_table.iter()
+            .filter(|&(&(fid, _), _)| fid == file_id)
+            .map(|(_, &idx)| idx)
+            .collect();
+
+        for idx in &frame_indices {
+            if self.frame_meta[*idx].dirty {
+                self.flush_frame(*idx)?;
+            }
+            let key = (self.frame_meta[*idx].file_id, self.frame_meta[*idx].page_id);
+            self.page_table.remove(&key);
+            self.lru.retain(|&i| i != *idx);
+            self.frame_meta[*idx] = FrameMeta::empty();
+        }
+
+        self.files.remove(&file_id);
+        Ok(())
+    }
+
     // ── Internal helpers ──
 
     /// Ensure the requested page is present in a frame. Returns the frame index.
@@ -479,6 +501,14 @@ impl BufferPoolManager {
             pool.flush_all()?;
         }
         Ok(())
+    }
+
+    /// Evict all pages for a file from the specified pool and unregister it.
+    pub fn evict_file(&mut self, pool_id: BufferPoolId, file_id: FileId) -> Result<()> {
+        let pool = self.pools.get_mut(&pool_id).ok_or_else(|| {
+            Error::Catalog(format!("buffer pool id {pool_id} not found"))
+        })?;
+        pool.evict_file(file_id)
     }
 
     /// Return pool IDs and their names for diagnostics.

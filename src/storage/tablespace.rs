@@ -14,6 +14,8 @@ struct TableFileInfo {
     file_id: FileId,
     /// Binary max-heap free-space map. O(log P) search and update.
     fsm: FreeSpaceMap,
+    /// Path to the `.DAT` heap file.
+    dat_path: PathBuf,
     /// Path to the `.FSM` file for persistence.
     fsm_path: PathBuf,
 }
@@ -111,6 +113,7 @@ impl TablespaceManager {
                     pool_id,
                     file_id,
                     fsm,
+                    dat_path,
                     fsm_path,
                 },
             );
@@ -366,6 +369,33 @@ impl TablespaceManager {
         }
     }
 
+    /// Drop a table: evict its pages from the buffer pool and delete the
+    /// `.DAT` and `.FSM` files from disk.
+    pub fn drop_table(&mut self, schema: &str, table: &str) -> Result<()> {
+        let key = (schema.to_string(), table.to_string());
+        let info = self.table_files.remove(&key).ok_or_else(|| {
+            Error::Catalog(format!(
+                "table {schema}.{table} not registered in tablespace manager"
+            ))
+        })?;
+
+        self.pool_manager.evict_file(info.pool_id, info.file_id)?;
+
+        if info.dat_path.exists() {
+            std::fs::remove_file(&info.dat_path).map_err(|e| {
+                Error::Catalog(format!("failed to delete {}: {e}", info.dat_path.display()))
+            })?;
+        }
+        if info.fsm_path.exists() {
+            std::fs::remove_file(&info.fsm_path).map_err(|e| {
+                Error::Catalog(format!("failed to delete {}: {e}", info.fsm_path.display()))
+            })?;
+        }
+
+        log::info!("dropped table {schema}.{table}");
+        Ok(())
+    }
+
     /// Flush all dirty pages across all buffer pools and persist FSMs.
     pub fn flush_all(&mut self) -> Result<()> {
         self.pool_manager.flush_all()?;
@@ -401,6 +431,7 @@ impl TablespaceManager {
                 pool_id,
                 file_id,
                 fsm: FreeSpaceMap::new(0, page_size),
+                dat_path,
                 fsm_path,
             },
         );
@@ -472,6 +503,7 @@ mod tests {
                 pool_id: 1,
                 file_id,
                 fsm: FreeSpaceMap::new(0, PAGE_SIZE),
+                dat_path: dat_path.clone(),
                 fsm_path: fsm_path_for(&dat_path),
             },
         );
@@ -576,6 +608,7 @@ mod tests {
                     pool_id: 1,
                     file_id,
                     fsm: FreeSpaceMap::new(0, PAGE_SIZE),
+                    dat_path: dat_path.clone(),
                     fsm_path: fsm_path_for(&dat_path),
                 },
             );
@@ -610,6 +643,7 @@ mod tests {
                     file_id,
                     fsm: FreeSpaceMap::load(&fsm_path).unwrap()
                         .unwrap_or_else(|| FreeSpaceMap::new(0, PAGE_SIZE)),
+                    dat_path: dat_path.clone(),
                     fsm_path,
                 },
             );
