@@ -22,12 +22,19 @@ const DEFAULT_DFT_TABLESPACE: &str = "USERTBSP";
 /// Default system catalog schema name.
 const DEFAULT_SYS_SCHEMA: &str = "RQSYS";
 
+/// On-disk format version. Incremented on breaking changes (e.g. MVCC
+/// tuple headers). Databases created with older versions are rejected
+/// with a clear error on open.
+pub const FORMAT_VERSION: u32 = 2;
+
 /// Database configuration parameters stored in `admin/SQLDBCONF`.
 ///
 /// Follows the DB2 convention of a per-database configuration file.
 /// Each parameter is a key-value pair written as `KEY = VALUE`.
 #[derive(Debug, Clone)]
 pub struct DbConfig {
+    /// On-disk format version for backward-compatibility detection.
+    pub format_version: u32,
     /// Default page size in bytes for new tablespaces.
     pub page_size: usize,
     /// Diagnostic/logging level (OFF, ERROR, WARN, INFO, DEBUG, TRACE).
@@ -40,17 +47,21 @@ pub struct DbConfig {
     pub default_tablespace: String,
     /// System catalog schema name (e.g. `RQSYS`).  All catalog tables live here.
     pub sys_schema: String,
+    /// Next transaction ID to allocate (persisted for monotonic TxIDs).
+    pub next_txid: u64,
 }
 
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
+            format_version: FORMAT_VERSION,
             page_size: DEFAULT_PAGE_SIZE,
             diag_level: "INFO".to_string(),
             text_mode: false,
             default_schema: DEFAULT_DFT_SCHEMA.to_string(),
             default_tablespace: DEFAULT_DFT_TABLESPACE.to_string(),
             sys_schema: DEFAULT_SYS_SCHEMA.to_string(),
+            next_txid: 1,
         }
     }
 }
@@ -61,8 +72,11 @@ impl DbConfig {
         let path = data_dir.join("admin").join(SQLDBCONF_FILE);
         let content = format!(
             "\
--- RustDB Database Configuration (SQLDBCONF)
+-- RQDB Database Configuration (SQLDBCONF)
 -- Modify only when the database is offline.
+
+-- On-disk format version.  Do not change manually.
+FORMAT_VERSION = {}
 
 -- Default page size (bytes) for new tablespaces.
 PAGESIZE = {}
@@ -81,13 +95,18 @@ DFT_TBSP = {}
 
 -- System catalog schema name.  Do not change after bootstrap.
 SYS_SCHEMA = {}
+
+-- Next transaction ID (monotonic counter).  Updated on shutdown.
+NEXT_TXID = {}
 ",
+            self.format_version,
             self.page_size,
             self.diag_level,
             if self.text_mode { "TRUE" } else { "FALSE" },
             self.default_schema,
             self.default_tablespace,
             self.sys_schema,
+            self.next_txid,
         );
         fs::write(&path, content)?;
         log::info!("wrote {}", path.display());
@@ -99,6 +118,20 @@ SYS_SCHEMA = {}
         let path = data_dir.join("admin").join(SQLDBCONF_FILE);
         let content = fs::read_to_string(&path)?;
         let map = parse_kv(&content)?;
+
+        // Format version check — reject databases from older (incompatible) versions.
+        // Databases without FORMAT_VERSION are version 1 (pre-MVCC).
+        let format_version = parse_u32(&map, "FORMAT_VERSION", 1)?;
+        if format_version != FORMAT_VERSION {
+            return Err(Error::Catalog(format!(
+                "incompatible database format version {} (expected {}). \
+                 This database was created with {} version of RQDB and cannot \
+                 be opened. Please recreate the database.",
+                format_version,
+                FORMAT_VERSION,
+                if format_version < FORMAT_VERSION { "an older" } else { "a newer" },
+            )));
+        }
 
         let page_size = parse_usize(&map, "PAGESIZE", DEFAULT_PAGE_SIZE)?;
         if !page_size.is_power_of_two() || page_size < 512 {
@@ -136,13 +169,17 @@ SYS_SCHEMA = {}
             .cloned()
             .unwrap_or_else(|| DEFAULT_SYS_SCHEMA.to_string());
 
+        let next_txid = parse_u64(&map, "NEXT_TXID", 1)?;
+
         Ok(Self {
+            format_version,
             page_size,
             diag_level,
             text_mode,
             default_schema,
             default_tablespace,
             sys_schema,
+            next_txid,
         })
     }
 }
@@ -164,6 +201,24 @@ fn parse_kv(content: &str) -> Result<HashMap<String, String>> {
         map.insert(key.trim().to_uppercase(), value.trim().to_string());
     }
     Ok(map)
+}
+
+fn parse_u32(map: &HashMap<String, String>, key: &str, default: u32) -> Result<u32> {
+    match map.get(key) {
+        Some(v) => v.parse::<u32>().map_err(|_| {
+            Error::Catalog(format!("SQLDBCONF: invalid numeric value for {key}: {v}"))
+        }),
+        None => Ok(default),
+    }
+}
+
+fn parse_u64(map: &HashMap<String, String>, key: &str, default: u64) -> Result<u64> {
+    match map.get(key) {
+        Some(v) => v.parse::<u64>().map_err(|_| {
+            Error::Catalog(format!("SQLDBCONF: invalid numeric value for {key}: {v}"))
+        }),
+        None => Ok(default),
+    }
 }
 
 fn parse_usize(map: &HashMap<String, String>, key: &str, default: usize) -> Result<usize> {
@@ -217,7 +272,10 @@ mod tests {
     #[test]
     fn reject_bad_page_size() {
         let dir = tmp_dir("cfg_bad_ps");
-        fs::write(dir.join("admin/SQLDBCONF"), "PAGESIZE = 1000\n").unwrap();
+        fs::write(
+            dir.join("admin/SQLDBCONF"),
+            format!("FORMAT_VERSION = {FORMAT_VERSION}\nPAGESIZE = 1000\n"),
+        ).unwrap();
         let err = DbConfig::read(&dir).unwrap_err();
         assert!(err.to_string().contains("power of two"));
         fs::remove_dir_all(&dir).unwrap();
@@ -226,9 +284,33 @@ mod tests {
     #[test]
     fn reject_bad_diaglevel() {
         let dir = tmp_dir("cfg_bad_dl");
-        fs::write(dir.join("admin/SQLDBCONF"), "DIAGLEVEL = VERBOSE\n").unwrap();
+        fs::write(
+            dir.join("admin/SQLDBCONF"),
+            format!("FORMAT_VERSION = {FORMAT_VERSION}\nDIAGLEVEL = VERBOSE\n"),
+        ).unwrap();
         let err = DbConfig::read(&dir).unwrap_err();
         assert!(err.to_string().contains("invalid DIAGLEVEL"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reject_old_format_version() {
+        let dir = tmp_dir("cfg_old_ver");
+        fs::write(dir.join("admin/SQLDBCONF"), "FORMAT_VERSION = 1\n").unwrap();
+        let err = DbConfig::read(&dir).unwrap_err();
+        assert!(err.to_string().contains("incompatible database format"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn roundtrip_next_txid() {
+        let dir = tmp_dir("cfg_txid");
+        let mut cfg = DbConfig::default();
+        cfg.next_txid = 42;
+        cfg.write(&dir).unwrap();
+        let loaded = DbConfig::read(&dir).unwrap();
+        assert_eq!(loaded.next_txid, 42);
+        assert_eq!(loaded.format_version, FORMAT_VERSION);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

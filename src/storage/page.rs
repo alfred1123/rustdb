@@ -31,7 +31,7 @@ fn page_type_of(buf: &[u8]) -> u8 {
     buf[PAGE_TYPE_OFF]
 }
 
-fn slot_count_of(buf: &[u8]) -> u16 {
+pub(crate) fn slot_count_of(buf: &[u8]) -> u16 {
     get_u16(buf, SLOT_COUNT_OFF)
 }
 
@@ -45,7 +45,7 @@ pub(crate) fn free_space_of(buf: &[u8]) -> usize {
     }
 }
 
-fn slot_of(buf: &[u8], idx: SlotIndex) -> (u16, u16) {
+pub(crate) fn slot_of(buf: &[u8], idx: SlotIndex) -> (u16, u16) {
     let base = PAGE_HEADER_SIZE + (idx as usize) * SLOT_SIZE;
     (get_u16(buf, base), get_u16(buf, base + 2))
 }
@@ -208,7 +208,7 @@ pub(crate) fn verify_checksum_of(buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn update_checksum_of(buf: &mut [u8]) {
+pub(crate) fn update_checksum_of(buf: &mut [u8]) {
     let crc = checksum_of(buf);
     put_u32(buf, CHECKSUM_OFF, crc);
 }
