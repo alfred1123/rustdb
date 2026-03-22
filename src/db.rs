@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::catalog;
 use crate::catalog::cache::CatalogCache;
 use crate::catalog::config::DbConfig;
+use crate::error::{sql_error, SqlState};
 use crate::storage::tablespace::TablespaceManager;
 
 /// Active database state: catalog cache, tablespace manager, and metadata.
@@ -17,12 +18,15 @@ pub fn open_database(base_dir: &Path, name: &str) -> Result<DbState, crate::erro
     let data_dir = base_dir.join(name);
     let sqldbconf = data_dir.join("admin").join("SQLDBCONF");
     if !sqldbconf.exists() {
-        return Err(crate::error::Error::Catalog(format!(
-            "database '{}' not found at {}. Use CREATE DATABASE {} to create it.",
-            name,
-            data_dir.display(),
-            name
-        )));
+        return Err(sql_error(
+            SqlState::DatabaseNotFound,
+            format!(
+                "database '{}' not found at {}. Use CREATE DATABASE {} to create it.",
+                name,
+                data_dir.display(),
+                name
+            ),
+        ));
     }
 
     let config = DbConfig::read(&data_dir)?;
@@ -48,12 +52,15 @@ pub fn create_database(
     let data_dir = base_dir.join(name);
     let sqldbconf = data_dir.join("admin").join("SQLDBCONF");
     if sqldbconf.exists() {
-        return Err(crate::error::Error::Catalog(format!(
-            "database '{}' already exists at {}. Use CONNECT TO {} to connect.",
-            name,
-            data_dir.display(),
-            name
-        )));
+        return Err(sql_error(
+            SqlState::DatabaseAlreadyExists,
+            format!(
+                "database '{}' already exists at {}. Use CONNECT TO {} to connect.",
+                name,
+                data_dir.display(),
+                name
+            ),
+        ));
     }
 
     let cfg = DbConfig {

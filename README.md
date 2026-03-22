@@ -6,8 +6,9 @@ standards.
 
 **Status:** Storage engine and full CRUD SQL are complete. CREATE TABLE, DROP
 TABLE, INSERT, UPDATE, DELETE, and SELECT all work with WHERE filtering. Data
-persists across restarts. MVCC (xmin/xmax tuple headers), transactions
-(BEGIN/COMMIT/ROLLBACK), and VACUUM are next.
+persists across restarts. MVCC foundation modules are implemented (tuple
+headers, transaction manager, crash-safe TxID persistence). Wiring MVCC into
+the executor (BEGIN/COMMIT/ROLLBACK) and adding VACUUM are next.
 
 ## Why RQDB?
 
@@ -39,6 +40,13 @@ persists across restarts. MVCC (xmin/xmax tuple headers), transactions
 - **Safe database management.** `CONNECT TO` and `CREATE DATABASE` commands
   prevent accidental data loss — connecting requires an existing database,
   creating requires a non-existent one.
+- **Comprehensive SQLSTATE error codes.** Every user-facing error returns a
+  proper ANSI/DB2/PostgreSQL SQLSTATE code (17 codes implemented), with
+  integration tests for each.
+- **MVCC foundation in place.** Tuple header module (`xmin`/`xmax`
+  serialization, visibility checks), transaction manager (TxID allocation,
+  state tracking), and crash-safe TxID persistence (`admin/TXLOG` with
+  fsync) — ready to wire into the executor.
 - **Interactive SQL REPL** with immediate feedback and SQLSTATE error codes.
 
 ### Comparison with Other Databases
@@ -55,7 +63,7 @@ persists across restarts. MVCC (xmin/xmax tuple headers), transactions
 | **Concurrency** | Single-session (multi-session planned) | File-level locking / WAL mode | Full MVCC | Single-writer |
 | **SQL coverage** | SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
 | **Transactions** | MVCC with xmin/xmax (in progress) | WAL or journal | WAL + MVCC | WAL |
-| **Codebase size** | ~7K lines | ~150K lines | ~1.5M lines | ~300K lines |
+| **Codebase size** | ~7.4K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
 ### When to Consider RQDB
 
@@ -167,7 +175,7 @@ rqdb --text-mode create database DEBUGDB
 # Verbose logging (debug level)
 RUST_LOG=debug rqdb connect to MYDB
 
-# Run tests (130+ tests)
+# Run tests (198 tests: 153 unit + 45 integration)
 cargo test
 ```
 
@@ -248,6 +256,19 @@ Each `.DAT` file is a sequence of fixed-size slotted pages (default 4096 bytes).
 Each page contains a 24-byte header, a slot directory growing forward, and row
 data growing backward. Pages are checksummed with CRC32.
 
+Every row is prefixed with a 16-byte MVCC tuple header:
+
+```
+[xmin: u64 LE][xmax: u64 LE][field1_len: u64 LE][field1_value]...
+ ◄── 16-byte visibility ──►  ◄── user data (length-prefixed fields) ──►
+```
+
+- `xmin` — TxID that created the tuple (0 = bootstrap)
+- `xmax` — TxID that deleted/superseded it (0 = live)
+
+The tuple header reduces per-page usable payload by 16 bytes. For a 4096-byte
+page: max user data per row = 4052 bytes, max columns = 450.
+
 Within each row, fields are encoded as length-prefixed values:
 
 ```
@@ -272,13 +293,23 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 ## Next Milestone: MVCC, Transactions, and VACUUM
 
 RQDB is moving from physical delete / in-place update to PostgreSQL-style
-MVCC — each row carries an `xmin`/`xmax` tuple header for visibility,
-updates are append-only (old row marked dead, new row inserted), and a
-`VACUUM` command reclaims dead space. A basic transaction manager
-(`BEGIN`/`COMMIT`/`ROLLBACK`) provides the TxID lifecycle.
+MVCC. The foundation modules are implemented:
+
+- **`src/storage/tuple.rs`** — 16-byte `xmin`/`xmax` header: serialization,
+  visibility checks, in-place `xmax` mutation, prepend/strip helpers (16 tests)
+- **`src/transaction/tx.rs`** — Transaction manager: monotonic TxID
+  allocation, state tracking (Active/Committed/Aborted), `begin`/`commit`/
+  `abort` lifecycle (11 tests including crash-safe TXLOG persistence)
+- **`admin/TXLOG`** — Crash-safe TxID persistence: 8-byte LE file fsync'd
+  on every BEGIN (future: WAL replaces this)
+
+**Remaining:** wire tuple headers into bootstrap, tablespace insert/delete/
+update/scan, executor (BEGIN/COMMIT/ROLLBACK dispatch, auto-commit), VACUUM
+page compaction, and REPL integration.
 
 See [src/transaction/README.md](src/transaction/README.md) for the full
-design: tuple header format, visibility rules, operation changes, VACUUM
+design: on-disk layout diagrams, xmin/xmax state table, worked examples,
+MVCC flow diagrams (INSERT/DELETE/UPDATE/SCAN/ROLLBACK/COMMIT), VACUUM
 algorithm, and implementation plan.
 
 ## Roadmap
@@ -296,11 +327,15 @@ algorithm, and implementation plan.
 - [x] UPDATE in SQL executor (in-place with row migration)
 - [x] CREATE TABLE (DDL) with auto-schema creation and catalog registration
 - [x] Data persistence across restart (flush + reload)
-- [x] SQLSTATE error codes for all SQL errors
+- [x] SQLSTATE error codes (17 codes with integration tests for each)
 - [x] CONNECT TO / CREATE DATABASE / DISCONNECT (safe database management)
 - [x] DROP TABLE (DDL)
-- [ ] MVCC with xmin/xmax tuple headers (next)
-- [ ] Transaction manager (BEGIN / COMMIT / ROLLBACK)
+- [x] MVCC tuple header module (xmin/xmax serialization, visibility checks)
+- [x] Transaction manager (TxID allocation, state tracking, begin/commit/abort)
+- [x] Crash-safe TxID persistence (admin/TXLOG with fsync)
+- [x] Row/column limit validation accounts for 16-byte MVCC tuple header
+- [ ] Wire MVCC into executor (BEGIN/COMMIT/ROLLBACK SQL commands) — next
+- [ ] Bootstrap catalog rows with tuple headers (xmin=0)
 - [ ] PCTFREE per-table free space reservation
 - [ ] VACUUM (manual dead-tuple reclamation)
 - [ ] Write-ahead log (WAL) with ARIES-style recovery

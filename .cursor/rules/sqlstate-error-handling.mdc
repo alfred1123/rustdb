@@ -1,0 +1,63 @@
+---
+description: Use SQLSTATE codes for all user-facing errors — never raw Error::Catalog or Error::Io for SQL-layer failures
+globs: "**/*.rs"
+alwaysApply: true
+---
+
+# SQLSTATE Error Handling
+
+All user-facing errors in RQDB must use `Error::Sql { state, message }` with
+a proper `SqlState` variant — never `Error::Catalog(...)` for conditions that
+a SQL user can trigger.
+
+## Rules
+
+- **Every new error condition needs a SQLSTATE code.** Before returning an
+  error from the executor, db.rs, or any SQL-facing path, check if an
+  existing `SqlState` variant fits. If not, add a new one with its ANSI/DB2/
+  PostgreSQL code and document it in `src/sql/README.md`.
+- **`Error::Catalog` is for internal catalog inconsistencies only** — things
+  like a missing system table or corrupt bootstrap data that the user cannot
+  cause through SQL.
+- **`Error::Io` and `Error::Corruption` stay for infrastructure errors** — disk
+  failures, checksum mismatches, etc.
+- **Use `sql_error()` helper** — never construct `Error::Sql { .. }` directly.
+  The helper in `src/error.rs` ensures consistent formatting.
+- **Integration tests for every SQLSTATE** — each reachable code must have at
+  least one end-to-end test in `tests/integration.rs` that asserts the
+  specific SQLSTATE string (e.g. `"42S02"`, `"54010"`).
+- **Document in `src/sql/README.md`** — the SQLSTATE table must list every
+  implemented code with its meaning and an example trigger.
+
+## Code Reference
+
+```rust
+// ✅ Correct — use sql_error with a specific SqlState
+use crate::error::{sql_error, SqlState};
+return Err(sql_error(SqlState::TableNotFound, format!("table {} not found", name)));
+
+// ❌ Wrong — generic Catalog error for a user-triggerable condition
+return Err(Error::Catalog(format!("table {} not found", name)));
+```
+
+## Existing Codes (src/error.rs)
+
+| Code  | Variant               | Meaning                          |
+|-------|-----------------------|----------------------------------|
+| 42000 | SyntaxError           | Syntax / access rule violation   |
+| 42S02 | TableNotFound         | Table not found                  |
+| 42S22 | ColumnNotFound        | Column not found                 |
+| 42601 | ParseError            | SQL parse error                  |
+| 42S01 | TableAlreadyExists    | Table already exists             |
+| 42711 | DuplicateColumnName   | Duplicate column in CREATE TABLE |
+| 42611 | InvalidColumnLength   | Invalid CHAR/VARCHAR length      |
+| 42508 | SystemSchemaViolation | Create/drop in system schema     |
+| 42P04 | DatabaseAlreadyExists | Database already exists           |
+| 3D000 | DatabaseNotFound      | Database not found               |
+| 54010 | RowTooLarge           | Row exceeds page payload         |
+| 54011 | TooManyColumns        | Column count exceeds limit       |
+| 21S01 | InsertValueListMismatch | Value count ≠ column count     |
+| 22000 | DataException         | Unsupported literal type         |
+| 22005 | AssignmentError       | Type mismatch in assignment      |
+| 23502 | NotNullViolation      | NULL in NOT NULL column          |
+| 0A000 | FeatureNotSupported   | Unsupported SQL feature          |

@@ -59,6 +59,10 @@ pub enum SqlState {
     TooManyColumns,
     /// 42508 — Cannot create object in system schema
     SystemSchemaViolation,
+    /// 42P04 — Database already exists (PostgreSQL convention)
+    DatabaseAlreadyExists,
+    /// 3D000 — Invalid catalog name (database not found)
+    DatabaseNotFound,
 }
 
 impl std::fmt::Display for SqlState {
@@ -82,6 +86,8 @@ impl std::fmt::Display for SqlState {
             SqlState::InvalidColumnLength => "42611",
             SqlState::TooManyColumns => "54011",
             SqlState::SystemSchemaViolation => "42508",
+            SqlState::DatabaseAlreadyExists => "42P04",
+            SqlState::DatabaseNotFound => "3D000",
         };
         write!(f, "{code}")
     }

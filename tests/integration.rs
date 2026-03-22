@@ -10,9 +10,12 @@ use rqdb::catalog::bootstrap;
 use rqdb::catalog::cache::CatalogCache;
 use rqdb::catalog::config::DbConfig;
 use rqdb::catalog::loader;
+use rqdb::catalog::row::MIN_COLUMN_BYTES;
 use rqdb::sql::{executor, parser};
 use rqdb::sql::types::Value;
+use rqdb::storage::page::PAGE_HEADER_SIZE;
 use rqdb::storage::tablespace::TablespaceManager;
+use rqdb::storage::tuple::TUPLE_HEADER_SIZE;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -282,8 +285,8 @@ fn connect_to_nonexistent_errors() {
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("not found"),
-                "expected 'not found' in error, got: {msg}"
+                msg.contains("3D000"),
+                "expected SQLSTATE 3D000 (DatabaseNotFound), got: {msg}"
             );
         }
         Ok(_) => panic!("expected error for nonexistent database"),
@@ -312,14 +315,14 @@ fn create_database_already_exists_errors() {
     // Create the database once
     rqdb::create_database(&base, "DUPDB", false).unwrap();
 
-    // Second create should fail
+    // Second create should fail with SQLSTATE 42P04
     let result = rqdb::create_database(&base, "DUPDB", false);
     match result {
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("already exists"),
-                "expected 'already exists' in error, got: {msg}"
+                msg.contains("42P04"),
+                "expected SQLSTATE 42P04 (DatabaseAlreadyExists), got: {msg}"
             );
         }
         Ok(_) => panic!("expected error for duplicate database"),
@@ -390,4 +393,442 @@ fn disconnect_then_connect_different_db() {
     assert!(state2.cache.get_table("PUBLIC", "T1").is_none());
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// Tests: SQLSTATE error codes — end-to-end validation
+// ---------------------------------------------------------------------------
+
+/// Assert that a SQL execution result is an error containing the given SQLSTATE code.
+fn assert_sqlstate_integ(result: rqdb::error::Result<rqdb::sql::types::ResultSet>, code: &str) {
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains(code),
+                "expected SQLSTATE {code} in error, got: {msg}"
+            );
+        }
+        Ok(_) => panic!("expected SQLSTATE {code} error, got Ok"),
+    }
+}
+
+// 42S02 — TableNotFound
+
+#[test]
+fn sqlstate_table_not_found_select() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s02_sel");
+    assert_sqlstate_integ(
+        run("SELECT * FROM ghost_table", &mut cache, &mut tsm),
+        "42S02",
+    );
+}
+
+#[test]
+fn sqlstate_table_not_found_insert() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s02_ins");
+    assert_sqlstate_integ(
+        run("INSERT INTO ghost_table VALUES (1)", &mut cache, &mut tsm),
+        "42S02",
+    );
+}
+
+#[test]
+fn sqlstate_table_not_found_delete() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s02_del");
+    assert_sqlstate_integ(
+        run("DELETE FROM ghost_table WHERE id = 1", &mut cache, &mut tsm),
+        "42S02",
+    );
+}
+
+#[test]
+fn sqlstate_table_not_found_update() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s02_upd");
+    assert_sqlstate_integ(
+        run("UPDATE ghost_table SET x = 1", &mut cache, &mut tsm),
+        "42S02",
+    );
+}
+
+#[test]
+fn sqlstate_table_not_found_drop() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s02_drop");
+    assert_sqlstate_integ(
+        run("DROP TABLE ghost_table", &mut cache, &mut tsm),
+        "42S02",
+    );
+}
+
+// 42S22 — ColumnNotFound
+
+#[test]
+fn sqlstate_column_not_found_in_select() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s22_sel");
+    run("CREATE TABLE t (id INTEGER, name VARCHAR(20))", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("SELECT bogus FROM t", &mut cache, &mut tsm),
+        "42S22",
+    );
+}
+
+#[test]
+fn sqlstate_column_not_found_in_where() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s22_whr");
+    run("CREATE TABLE t (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    run("INSERT INTO t VALUES (1)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("SELECT * FROM t WHERE ghost = 1", &mut cache, &mut tsm),
+        "42S22",
+    );
+}
+
+#[test]
+fn sqlstate_column_not_found_in_update_set() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s22_upd");
+    run("CREATE TABLE t (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    run("INSERT INTO t VALUES (1)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("UPDATE t SET ghost = 99 WHERE id = 1", &mut cache, &mut tsm),
+        "42S22",
+    );
+}
+
+// 42S01 — TableAlreadyExists
+
+#[test]
+fn sqlstate_table_already_exists() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42s01");
+    run("CREATE TABLE dup (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("CREATE TABLE dup (x VARCHAR(10))", &mut cache, &mut tsm),
+        "42S01",
+    );
+}
+
+// 42711 — DuplicateColumnName
+
+#[test]
+fn sqlstate_duplicate_column_name() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42711");
+    assert_sqlstate_integ(
+        run("CREATE TABLE bad (id INTEGER, name VARCHAR(10), id SMALLINT)", &mut cache, &mut tsm),
+        "42711",
+    );
+}
+
+// 42611 — InvalidColumnLength
+
+#[test]
+fn sqlstate_invalid_column_length_zero() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42611_z");
+    assert_sqlstate_integ(
+        run("CREATE TABLE bad (name CHAR(0))", &mut cache, &mut tsm),
+        "42611",
+    );
+}
+
+#[test]
+fn sqlstate_invalid_column_length_too_large() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42611_big");
+    assert_sqlstate_integ(
+        run("CREATE TABLE bad (data VARCHAR(40000))", &mut cache, &mut tsm),
+        "42611",
+    );
+}
+
+// 42508 — SystemSchemaViolation
+
+#[test]
+fn sqlstate_system_schema_create_rejected() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42508_cr");
+    assert_sqlstate_integ(
+        run("CREATE TABLE RQSYS.forbidden (id INTEGER)", &mut cache, &mut tsm),
+        "42508",
+    );
+}
+
+#[test]
+fn sqlstate_system_schema_drop_rejected() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42508_dr");
+    assert_sqlstate_integ(
+        run("DROP TABLE RQSYS.SYSTABLES", &mut cache, &mut tsm),
+        "42508",
+    );
+}
+
+// 21S01 — InsertValueListMismatch
+
+#[test]
+fn sqlstate_insert_value_list_mismatch_too_few() {
+    let (mut cache, mut tsm, _db) = open_db("integ_21s01_few");
+    run("CREATE TABLE t (id INTEGER, name VARCHAR(20), qty INTEGER)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("INSERT INTO t VALUES (1, 'x')", &mut cache, &mut tsm),
+        "21S01",
+    );
+}
+
+#[test]
+fn sqlstate_insert_value_list_mismatch_too_many() {
+    let (mut cache, mut tsm, _db) = open_db("integ_21s01_many");
+    run("CREATE TABLE t (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("INSERT INTO t VALUES (1, 'extra', 99)", &mut cache, &mut tsm),
+        "21S01",
+    );
+}
+
+// 23502 — NotNullViolation
+
+#[test]
+fn sqlstate_not_null_violation() {
+    let (mut cache, mut tsm, _db) = open_db("integ_23502");
+    run("CREATE TABLE t (id INTEGER NOT NULL, name VARCHAR(20))", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("INSERT INTO t VALUES (NULL, 'Alice')", &mut cache, &mut tsm),
+        "23502",
+    );
+}
+
+// 22005 — AssignmentError (type mismatch)
+
+#[test]
+fn sqlstate_assignment_error_string_to_int() {
+    let (mut cache, mut tsm, _db) = open_db("integ_22005");
+    run("CREATE TABLE t (id INTEGER, name VARCHAR(20))", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("INSERT INTO t VALUES ('not_a_number', 'Alice')", &mut cache, &mut tsm),
+        "22005",
+    );
+}
+
+// 0A000 — FeatureNotSupported
+
+#[test]
+fn sqlstate_feature_not_supported_join() {
+    let (mut cache, mut tsm, _db) = open_db("integ_0a000_join");
+    run("CREATE TABLE a (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    run("CREATE TABLE b (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("SELECT * FROM a JOIN b ON a.id = b.id", &mut cache, &mut tsm),
+        "0A000",
+    );
+}
+
+#[test]
+fn sqlstate_feature_not_supported_unsupported_stmt() {
+    let (mut cache, mut tsm, _db) = open_db("integ_0a000_stmt");
+    assert_sqlstate_integ(
+        run("ALTER TABLE SYSTABLES ADD COLUMN x INTEGER", &mut cache, &mut tsm),
+        "0A000",
+    );
+}
+
+// 42000 — SyntaxError (semantic, not parse)
+
+#[test]
+fn sqlstate_syntax_error_no_from() {
+    let (mut cache, mut tsm, _db) = open_db("integ_42000_nofrom");
+    assert_sqlstate_integ(
+        run("SELECT * FROM a, b", &mut cache, &mut tsm),
+        "42000",
+    );
+}
+
+// 22000 — DataException
+
+#[test]
+fn sqlstate_data_exception_unsupported_literal() {
+    let (mut cache, mut tsm, _db) = open_db("integ_22000");
+    run("CREATE TABLE t (id INTEGER)", &mut cache, &mut tsm).unwrap();
+    assert_sqlstate_integ(
+        run("INSERT INTO t VALUES (X'DEADBEEF')", &mut cache, &mut tsm),
+        "22000",
+    );
+}
+
+// DROP TABLE IF EXISTS — should NOT error
+
+#[test]
+fn drop_table_if_exists_no_error() {
+    let (mut cache, mut tsm, _db) = open_db("integ_dt_ifexists");
+    let rs = run("DROP TABLE IF EXISTS nonexistent", &mut cache, &mut tsm).unwrap();
+    assert!(rs.rows[0][0].to_string().contains("skipped"));
+}
+
+// DROP TABLE full lifecycle (integration)
+
+#[test]
+fn drop_table_end_to_end() {
+    let (mut cache, mut tsm, _db) = open_db("integ_dt_e2e");
+
+    run("CREATE TABLE dropme (id INTEGER NOT NULL, val VARCHAR(30))", &mut cache, &mut tsm).unwrap();
+    run("INSERT INTO dropme VALUES (1, 'alpha')", &mut cache, &mut tsm).unwrap();
+    run("INSERT INTO dropme VALUES (2, 'beta')", &mut cache, &mut tsm).unwrap();
+
+    let rs = run("SELECT * FROM dropme", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 2);
+
+    run("DROP TABLE dropme", &mut cache, &mut tsm).unwrap();
+
+    // Should not be queryable
+    assert_sqlstate_integ(
+        run("SELECT * FROM dropme", &mut cache, &mut tsm),
+        "42S02",
+    );
+
+    // Should not appear in catalog
+    let rs = run("SELECT * FROM SYSTABLES WHERE name = 'DROPME'", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 0);
+
+    let rs = run("SELECT * FROM SYSCOLUMNS WHERE tabname = 'DROPME'", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 0);
+
+    // Should be re-creatable
+    run("CREATE TABLE dropme (x VARCHAR(10))", &mut cache, &mut tsm).unwrap();
+    run("INSERT INTO dropme VALUES ('reborn')", &mut cache, &mut tsm).unwrap();
+    let rs = run("SELECT * FROM dropme", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(rs.rows[0][0].to_string(), "reborn");
+}
+
+// ---------------------------------------------------------------------------
+// Tests: Row size and column count limits (MVCC tuple header awareness)
+// ---------------------------------------------------------------------------
+
+const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length
+
+/// Compute the max user-data payload for a page, accounting for the 16-byte
+/// MVCC tuple header.  This mirrors the formula in executor.rs.
+fn max_user_payload(page_size: usize) -> usize {
+    page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE - TUPLE_HEADER_SIZE
+}
+
+#[test]
+fn row_size_limit_rejects_oversized_table() {
+    let (mut cache, mut tsm, _db) = open_db("integ_row_too_big");
+
+    // Default page size is 4096.
+    // max_user_payload = 4096 - 24 - 4 - 16 = 4052
+    // INTEGER = 8 (prefix) + 4 (data) = 12
+    // VARCHAR(4050) = 8 + 4050 = 4058
+    // Total = 12 + 4058 = 4070 > 4052  →  should be rejected
+    let err = run(
+        "CREATE TABLE too_big (id INTEGER, data VARCHAR(4050))",
+        &mut cache, &mut tsm,
+    );
+    assert!(err.is_err(), "expected RowTooLarge error");
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("54010"),
+        "expected SQLSTATE 54010 (RowTooLarge), got: {msg}"
+    );
+}
+
+#[test]
+fn row_size_limit_accepts_boundary_table() {
+    let (mut cache, mut tsm, _db) = open_db("integ_row_just_fit");
+
+    // max_user_payload = 4052
+    // INTEGER = 12,  VARCHAR(4032) = 8 + 4032 = 4040  →  total = 4052  (exact fit)
+    run(
+        "CREATE TABLE just_fit (id INTEGER, data VARCHAR(4032))",
+        &mut cache, &mut tsm,
+    ).expect("table at exact row-size boundary should be created");
+
+    // Verify the table exists in catalog
+    assert!(cache.get_table("PUBLIC", "JUST_FIT").is_some());
+}
+
+#[test]
+fn row_size_limit_boundary_insert_succeeds() {
+    let (mut cache, mut tsm, _db) = open_db("integ_row_bnd_ins");
+
+    // Create a table at the row-size boundary
+    run(
+        "CREATE TABLE bnd (id INTEGER, data VARCHAR(4032))",
+        &mut cache, &mut tsm,
+    ).unwrap();
+
+    // Insert a row with data shorter than the max — must succeed
+    run(
+        "INSERT INTO bnd VALUES (1, 'hello')",
+        &mut cache, &mut tsm,
+    ).expect("insert into boundary table should succeed");
+
+    // Verify the row is readable
+    let rs = run("SELECT * FROM bnd", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(rs.rows[0][0], Value::Integer(1));
+}
+
+#[test]
+fn column_count_limit_rejects_excess() {
+    let (mut cache, mut tsm, _db) = open_db("integ_col_excess");
+
+    let max_cols = max_user_payload(4096) / MIN_COLUMN_BYTES; // 4052 / 9 = 450
+
+    // One more than the limit should be rejected
+    let over = max_cols + 1;
+    let cols: Vec<String> = (0..over).map(|i| format!("c{i} CHAR(1)")).collect();
+    let sql = format!("CREATE TABLE too_wide ({})", cols.join(", "));
+    let err = run(&sql, &mut cache, &mut tsm);
+    assert!(err.is_err(), "expected TooManyColumns error for {over} columns");
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("54011"),
+        "expected SQLSTATE 54011 (TooManyColumns), got: {msg}"
+    );
+}
+
+#[test]
+fn column_count_limit_accepts_boundary() {
+    let (mut cache, mut tsm, _db) = open_db("integ_col_bnd");
+
+    let max_cols = max_user_payload(4096) / MIN_COLUMN_BYTES; // 450
+
+    // Exactly at the limit should succeed
+    let cols: Vec<String> = (0..max_cols).map(|i| format!("c{i} CHAR(1)")).collect();
+    let sql = format!("CREATE TABLE wide_ok ({})", cols.join(", "));
+    run(&sql, &mut cache, &mut tsm)
+        .unwrap_or_else(|e| panic!("table with {max_cols} columns should be created: {e}"));
+
+    assert!(cache.get_table("PUBLIC", "WIDE_OK").is_some());
+}
+
+#[test]
+fn column_count_boundary_insert_and_select() {
+    let (mut cache, mut tsm, _db) = open_db("integ_col_bnd_ins");
+
+    let max_cols = max_user_payload(4096) / MIN_COLUMN_BYTES; // 450
+
+    // Create a table at the column-count boundary
+    let cols: Vec<String> = (0..max_cols).map(|i| format!("c{i} CHAR(1)")).collect();
+    let sql = format!("CREATE TABLE wide ({})", cols.join(", "));
+    run(&sql, &mut cache, &mut tsm).unwrap();
+
+    // Insert a row with all columns set to 'A'
+    let vals: Vec<&str> = (0..max_cols).map(|_| "'A'").collect();
+    let sql = format!("INSERT INTO wide VALUES ({})", vals.join(", "));
+    run(&sql, &mut cache, &mut tsm)
+        .expect("insert into max-column table should succeed");
+
+    // Read it back
+    let rs = run("SELECT * FROM wide", &mut cache, &mut tsm).unwrap();
+    assert_eq!(rs.rows.len(), 1);
+    assert_eq!(rs.columns.len(), max_cols);
+}
+
+#[test]
+fn row_size_off_by_one_above_boundary_rejected() {
+    let (mut cache, mut tsm, _db) = open_db("integ_row_off1");
+
+    // max_user_payload = 4052.  INTEGER(12) + VARCHAR(4033)(8+4033=4041) = 4053 > 4052
+    let err = run(
+        "CREATE TABLE off1 (id INTEGER, data VARCHAR(4033))",
+        &mut cache, &mut tsm,
+    );
+    assert!(err.is_err(), "1 byte over the limit should be rejected");
+    assert!(err.unwrap_err().to_string().contains("54010"));
 }

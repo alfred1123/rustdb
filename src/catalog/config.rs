@@ -47,8 +47,6 @@ pub struct DbConfig {
     pub default_tablespace: String,
     /// System catalog schema name (e.g. `RQSYS`).  All catalog tables live here.
     pub sys_schema: String,
-    /// Next transaction ID to allocate (persisted for monotonic TxIDs).
-    pub next_txid: u64,
 }
 
 impl Default for DbConfig {
@@ -61,7 +59,6 @@ impl Default for DbConfig {
             default_schema: DEFAULT_DFT_SCHEMA.to_string(),
             default_tablespace: DEFAULT_DFT_TABLESPACE.to_string(),
             sys_schema: DEFAULT_SYS_SCHEMA.to_string(),
-            next_txid: 1,
         }
     }
 }
@@ -95,9 +92,6 @@ DFT_TBSP = {}
 
 -- System catalog schema name.  Do not change after bootstrap.
 SYS_SCHEMA = {}
-
--- Next transaction ID (monotonic counter).  Updated on shutdown.
-NEXT_TXID = {}
 ",
             self.format_version,
             self.page_size,
@@ -106,7 +100,6 @@ NEXT_TXID = {}
             self.default_schema,
             self.default_tablespace,
             self.sys_schema,
-            self.next_txid,
         );
         fs::write(&path, content)?;
         log::info!("wrote {}", path.display());
@@ -169,8 +162,6 @@ NEXT_TXID = {}
             .cloned()
             .unwrap_or_else(|| DEFAULT_SYS_SCHEMA.to_string());
 
-        let next_txid = parse_u64(&map, "NEXT_TXID", 1)?;
-
         Ok(Self {
             format_version,
             page_size,
@@ -179,7 +170,6 @@ NEXT_TXID = {}
             default_schema,
             default_tablespace,
             sys_schema,
-            next_txid,
         })
     }
 }
@@ -206,15 +196,6 @@ fn parse_kv(content: &str) -> Result<HashMap<String, String>> {
 fn parse_u32(map: &HashMap<String, String>, key: &str, default: u32) -> Result<u32> {
     match map.get(key) {
         Some(v) => v.parse::<u32>().map_err(|_| {
-            Error::Catalog(format!("SQLDBCONF: invalid numeric value for {key}: {v}"))
-        }),
-        None => Ok(default),
-    }
-}
-
-fn parse_u64(map: &HashMap<String, String>, key: &str, default: u64) -> Result<u64> {
-    match map.get(key) {
-        Some(v) => v.parse::<u64>().map_err(|_| {
             Error::Catalog(format!("SQLDBCONF: invalid numeric value for {key}: {v}"))
         }),
         None => Ok(default),
@@ -303,13 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_next_txid() {
-        let dir = tmp_dir("cfg_txid");
-        let mut cfg = DbConfig::default();
-        cfg.next_txid = 42;
+    fn roundtrip_format_version() {
+        let dir = tmp_dir("cfg_fmtver");
+        let cfg = DbConfig::default();
         cfg.write(&dir).unwrap();
         let loaded = DbConfig::read(&dir).unwrap();
-        assert_eq!(loaded.next_txid, 42);
         assert_eq!(loaded.format_version, FORMAT_VERSION);
         fs::remove_dir_all(&dir).unwrap();
     }

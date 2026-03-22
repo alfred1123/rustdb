@@ -43,11 +43,12 @@ SQL parser, planner, and executor.
 - Catalog rows are persisted to SYSTABLES and SYSCOLUMNS immediately
 - CatalogCache is updated in-memory so subsequent queries see the table instantly
 - Row size validation: rejects tables whose maximum row size exceeds the page payload limit
-  (page size − 24-byte header − 4-byte slot = max payload). Returns SQLSTATE 54010.
+  (page size − 24-byte page header − 4-byte slot − 16-byte MVCC tuple header = max payload).
+  Returns SQLSTATE 54010.
 - Duplicate column names rejected (SQLSTATE 42711)
 - Invalid CHAR/VARCHAR lengths rejected: must be 1–32672 (SQLSTATE 42611)
 - Column count limit: dynamically derived from page size (max payload / `MIN_COLUMN_BYTES`).
-  For a 4KB page this is 452 columns; for 8KB it's 907 (SQLSTATE 54011)
+  For a 4KB page this is 450 columns; for 8KB it's 905 (SQLSTATE 54011)
 - System schema protection: `CREATE TABLE RQSYS.<name>` is rejected (SQLSTATE 42508).
   Unqualified names default to the configured default schema (`DFT_SCHEMA`) for DDL.
 
@@ -261,6 +262,8 @@ Errors follow the ANSI SQL SQLSTATE convention (5-character codes):
 | 42711 | Duplicate column name              | `CREATE TABLE t (x INT, x INT)`              |
 | 54010 | Row too large for page size        | `CREATE TABLE` with columns exceeding page   |
 | 54011 | Too many columns                   | Column count exceeds page-derived limit      |
+| 3D000 | Database not found                 | `CONNECT TO NOSUCHDB`                        |
+| 42P04 | Database already exists             | `CREATE DATABASE x` when x exists            |
 | 0A000 | Feature not supported              | JOINs, unsupported expressions               |
 
 **Low priority / planned:**

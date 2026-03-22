@@ -12,6 +12,7 @@ use crate::sql::types::{ResultSet, TableRef, Value};
 use crate::storage::heap::Rid;
 use crate::storage::page::PAGE_HEADER_SIZE;
 use crate::storage::tablespace::TablespaceManager;
+use crate::storage::tuple::TUPLE_HEADER_SIZE;
 
 /// Execute a parsed SQL statement against the storage engine.
 pub fn execute(
@@ -412,12 +413,13 @@ fn execute_create_table(
     }
 
     // Reject if too many columns (dynamic limit from page size).
+    // Usable payload per row = page − page header − 1 slot entry − MVCC tuple header.
     let tbspaceid = cache.default_tablespace_id();
     let pagesize = cache
         .get_tablespace_by_id(tbspaceid as i32)
         .map(|ts| ts.pagesize as usize)
         .unwrap_or(4096);
-    let max_payload = pagesize - PAGE_HEADER_SIZE - 4; // header + 1 slot
+    let max_payload = pagesize - PAGE_HEADER_SIZE - 4 - TUPLE_HEADER_SIZE;
     let max_columns = max_payload / MIN_COLUMN_BYTES;
     if create.columns.len() > max_columns {
         return Err(sql_error(
@@ -1498,10 +1500,10 @@ mod tests {
     #[test]
     fn create_table_row_too_large() {
         let (mut cache, mut tsm, _dir) = test_fixture("ct_toobig");
-        // Page size is 4096. Header=24, slot=4 → max payload=4068.
+        // Page size is 4096. Header=24, slot=4, tuple header=16 → max payload=4052.
         // VARCHAR(4000) → 8+4000=4008, plus an INTEGER → 8+4=12.
         // Total: 4020 bytes — fits. Add another VARCHAR(100) → 8+100=108
-        // giving 4128 — exceeds 4068.
+        // giving 4128 — exceeds 4052.
         let stmts = parser::parse(
             "CREATE TABLE toobig (id INTEGER, data VARCHAR(4000), extra VARCHAR(100))",
         ).unwrap();
@@ -1514,9 +1516,10 @@ mod tests {
     #[test]
     fn create_table_row_just_fits() {
         let (mut cache, mut tsm, _dir) = test_fixture("ct_justfit");
-        // max payload = 4068. INTEGER=12, VARCHAR(4048)=8+4048=4056 → 4068 exactly.
+        // max payload = 4052 (page 4096 − header 24 − slot 4 − tuple hdr 16).
+        // INTEGER=12, VARCHAR(4032)=8+4032=4040 → 4052 exactly.
         let stmts = parser::parse(
-            "CREATE TABLE justfit (id INTEGER, data VARCHAR(4048))",
+            "CREATE TABLE justfit (id INTEGER, data VARCHAR(4032))",
         ).unwrap();
         let rs = execute(&stmts[0], &mut cache, &mut tsm).unwrap();
         assert!(rs.rows[0][0].to_string().contains("CREATED"));
@@ -1561,9 +1564,9 @@ mod tests {
     #[test]
     fn create_table_too_many_columns() {
         let (mut cache, mut tsm, _dir) = test_fixture("ct_maxcol");
-        // Page 4096: max_payload=4068, min 9 bytes/col → limit=452.
-        // 453 CHAR(1) columns should exceed the dynamic limit.
-        let cols: Vec<String> = (0..453).map(|i| format!("c{i} CHAR(1)")).collect();
+        // Page 4096: max_payload=4052 (4096−24−4−16), min 9 bytes/col → limit=450.
+        // 451 CHAR(1) columns should exceed the dynamic limit.
+        let cols: Vec<String> = (0..451).map(|i| format!("c{i} CHAR(1)")).collect();
         let sql = format!("CREATE TABLE huge ({})", cols.join(", "));
         let stmts = parser::parse(&sql).unwrap();
         assert_sqlstate(
