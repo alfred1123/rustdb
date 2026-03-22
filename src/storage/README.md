@@ -7,10 +7,11 @@ Page-based storage engine.
 | File             | Purpose                                         |
 |------------------|-------------------------------------------------|
 | `fsm.rs`         | Free Space Map: binary max-heap for O(log P) free-space search and update, `.FSM` file persistence |
-| `page.rs`        | Slotted page: 24-byte header, slot directory, row data, CRC32 checksums |
+| `page.rs`        | Slotted page: 24-byte header, slot directory, row data, CRC32 checksums, page compaction (VACUUM) |
 | `heap.rs`        | Heap file: manages a `.DAT` file as a sequence of slotted pages, RID addressing |
 | `pool.rs`        | Buffer pool: fixed-size frame pool, LRU eviction, dirty-page tracking, pin counts |
 | `tablespace.rs`  | Tablespace manager: maps (schema, table) to heap files, routes I/O through buffer pool |
+| `tuple.rs`       | Tuple header (xmin/xmax) serialization, visibility checks (planned) |
 
 ---
 
@@ -1024,6 +1025,129 @@ read consistency without abandoning the single-log model.
 The DB2-style architecture prioritises **correctness, testability, and
 simplicity** first. Each area above has a clear upgrade path when real
 workload data reveals the bottleneck — no premature optimisation required.
+
+---
+
+## VACUUM — Dead Tuple Reclamation
+
+VACUUM is a storage maintenance operation that reclaims space from dead
+tuples (rows where `xmax` is committed — see
+[transaction/README.md](../transaction/README.md) for the MVCC visibility
+model).
+
+### SQL Syntax
+
+```sql
+VACUUM tablename       -- vacuum a specific table
+VACUUM                 -- vacuum all user tables
+```
+
+### Algorithm
+
+For each page in the target table(s):
+
+1. **Identify dead tuples** — rows where `xmax` is committed.
+2. **Compact the page** — collect live rows, re-initialize the page, and
+   re-insert only the live rows. This closes gaps left by dead rows and
+   resets `data_start`.
+3. **Update the FSM** — report the new free space so future INSERTs can
+   use the reclaimed space.
+
+### Page Compaction (`compact_page`)
+
+A new function in `page.rs` that rewrites a page buffer in place:
+
+1. Scan all slots; collect `(slot_index, row_bytes)` for live rows
+   (slot offset ≠ 0).
+2. Re-initialize the page (reset `data_start` to end, `slot_count` to 0).
+3. Re-insert each live row in order, preserving slot indices where possible.
+4. Update the CRC32 checksum.
+
+### Complexity
+
+- Per page: O(live_rows_per_page) — copy + rebuild
+- Total: O(total_rows_in_table) for a full table vacuum
+- FSM update: O(log P) per compacted page
+
+### Integration
+
+- The SQL command is dispatched in `executor.rs` (via `execute_vacuum`)
+- The executor iterates all user tables (from catalog cache), calling
+  `tablespace.compact_table(schema, table)` for each
+- `compact_table` iterates pages via the buffer pool, calling
+  `compact_page` on each, then updating the FSM
+
+---
+
+## PCTFREE — Page Free Space Reservation
+
+### The Problem
+
+Without free space reservation, INSERTs fill pages to ~100% capacity.
+With MVCC append-only UPDATE (mark old dead + insert new), the new row
+version has no room on the same page. Every UPDATE goes to a distant page,
+destroying cache locality, dirtying two pages instead of one, and
+increasing I/O.
+
+### Solution
+
+Reserve a percentage of each page for UPDATE-generated row versions:
+
+- **INSERT** treats a page as "full" when free space drops below the
+  `pctfree` threshold (e.g., 10% = 409 bytes on a 4096-byte page).
+- **UPDATE** (new row version) is allowed to use the reserved space,
+  keeping old and new versions on the same page when possible.
+- The FSM `search()` already knows `page_size` — it additionally accounts
+  for the `pctfree` reservation when serving INSERT requests.
+
+### Storage: Per-Table in SYSTABLES
+
+PCTFREE is stored as a column in `SYSTABLES`:
+
+- `pctfree SMALLINT NOT NULL DEFAULT 10` — percentage (0–50)
+- Per-table granularity because different tables have different update
+  patterns: a lookup table (rarely updated) should use 0, while a
+  status-tracking table benefits from 20–30.
+- `CREATE TABLE` accepts an optional `PCTFREE n` clause; defaults to 10.
+
+**Why SYSTABLES, not SYSTABLESPACES:**
+
+- A tablespace groups tables by storage characteristics (page size, device),
+  not by workload pattern. Forcing all tables in a tablespace to share the
+  same PCTFREE would require creating separate tablespaces per update
+  pattern — impractical.
+- Every major database does it per-table:
+
+| Database   | Setting      | Default | Scope      |
+|------------|--------------|---------|------------|
+| PostgreSQL | `fillfactor` | 100     | Per-table  |
+| DB2        | `PCTFREE`    | 10      | Per-table  |
+| Oracle     | `PCTFREE`    | 10      | Per-table  |
+
+### FSM Integration
+
+The tablespace manager's `insert_row` passes an effective threshold to the
+FSM search:
+
+```
+effective_min_free = page_size * pctfree / 100
+needed = row_size + effective_min_free
+page = fsm.search(needed)
+```
+
+UPDATE-generated inserts bypass the PCTFREE check (they pass `needed =
+row_size` only), allowing them to use the reserved space.
+
+### Future: AI-Driven PCTFREE
+
+Track per-table workload statistics (UPDATE-to-INSERT ratio, average row
+size growth on update) and automatically suggest or adjust PCTFREE:
+
+- Tables with no UPDATEs → PCTFREE 0 (maximize storage density)
+- Heavy-update tables → PCTFREE 20–30 (keep versions co-located)
+- Similar to Oracle's Automatic Segment Space Management (ASSM)
+
+---
 
 ## New Dependencies
 

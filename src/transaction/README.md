@@ -1,242 +1,228 @@
 # transaction/
 
-Write-ahead log (WAL), transaction management, and ARIES-style recovery.
+MVCC transaction manager.
 
-## Design Decisions
+## Files (planned)
 
-- **Bootstrap is not WAL-logged.** Database creation (`bootstrap`) is a one-time
-  operation with no prior consistent state to recover to. If bootstrap fails,
-  the data directory is deleted and re-created. WAL logging begins only after
-  the database is fully initialized and operational.
+| File    | Purpose                                                                    |
+|---------|----------------------------------------------------------------------------|
+| `tx.rs` | Transaction manager: TxID allocation, state tracking, BEGIN/COMMIT/ROLLBACK |
 
-- **DB2-style in-place UPDATE.** Rows are overwritten directly in their
-  existing page slot. Old row data (before-image) is preserved only in the
-  WAL undo record — not on the data page. This keeps data pages compact
-  and eliminates the need for a VACUUM process.
+Related modules in other directories:
 
-- **WAL-first contract.** Every data mutation writes its log record to the
-  WAL **before** the data page is modified. On crash, the WAL is the source
-  of truth for recovery.
+- [`src/storage/tuple.rs`](../storage/tuple.rs) — Tuple header (xmin/xmax)
+  serialization and visibility checks (on-disk row format, lives with
+  `page.rs`, `heap.rs`, `tablespace.rs`)
+- [`src/storage/page.rs`](../storage/page.rs) — `compact_page` for VACUUM
+  (page-level compaction)
 
-## Architecture
+---
 
-```
-SQL Executor
-    │
-    ├─ txn.begin()                    → allocate TxnId
-    │
-    ├─ per DML statement:
-    │    ├─ WAL.write(log_record)     → append to WAL buffer
-    │    ├─ WAL.flush()               → fsync log to disk
-    │    └─ page mutation             → modify buffer pool page
-    │
-    ├─ txn.commit()                   → write COMMIT record, flush WAL
-    └─ txn.rollback()                → apply undo records in reverse
-```
+## Design: PostgreSQL-Style MVCC
 
-## WAL Log Record Format
+RQDB is moving from physical delete / in-place update to a PostgreSQL-style
+**multi-version concurrency control (MVCC)** model. The core trade-off:
+sacrifice storage for performance — dead rows stay on the page until `VACUUM`
+reclaims the space, avoiding costly in-place mutations and enabling future
+concurrent-reader support.
 
-Each log record is a variable-length entry in the WAL file:
+### Tuple Header
+
+Every row (user tables and system catalog) is prefixed with a 16-byte
+visibility header:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ Log Record Header (fixed 40 bytes)                   │
-│   lsn            : u64     — Log Sequence Number     │
-│   txn_id         : u64     — Transaction ID          │
-│   record_type    : u8      — see table below         │
-│   table_id       : u32     — (schema_hash, table_id) │
-│   page_id        : u64     — affected page           │
-│   slot           : u16     — affected slot            │
-│   prev_lsn       : u64     — previous LSN for txn    │
-│   body_len       : u32     — length of body bytes    │
-├──────────────────────────────────────────────────────┤
-│ Body (variable length)                               │
-│   depends on record_type — see below                 │
-└──────────────────────────────────────────────────────┘
+Offset  Field   Size    Meaning
+0       xmin    u64     TxID that created this tuple (0 = bootstrap)
+8       xmax    u64     TxID that deleted/superseded it (0 = live)
 ```
 
-All multi-byte values are **little-endian**, consistent with the page format.
+The header lives inside the slotted-page row data. `page.rs` remains generic
+(it stores opaque byte slices); tuple semantics are handled one layer up in
+the tablespace manager and executor.
 
-### Record Types
+### Visibility Rule
 
-| Type | Value | Body Contents | Undo Action | Redo Action |
-|------|-------|---------------|-------------|-------------|
-| `BEGIN` | 1 | (empty) | N/A | N/A |
-| `COMMIT` | 2 | (empty) | N/A | N/A |
-| `ROLLBACK` | 3 | (empty) | N/A | N/A |
-| `INSERT` | 10 | `[new_row_bytes]` | Delete the inserted row | Re-insert the row |
-| `DELETE` | 11 | `[old_row_bytes]` | Re-insert the deleted row | Delete the row again |
-| `UPDATE` | 12 | `[old_len: u32][old_row_bytes][new_row_bytes]` | Overwrite with old_row | Overwrite with new_row |
+A tuple is **visible** to a transaction if:
 
-### LSN (Log Sequence Number)
+- `xmin` is committed (or is the current transaction), AND
+- `xmax == 0` OR `xmax` is aborted (or not yet committed)
 
-The LSN is a **monotonically increasing u64** that uniquely identifies each
-log record's position. It serves as the ordering key for recovery.
+A tuple is **dead** (reclaimable by VACUUM) when:
 
-Each data page also carries a `page_lsn` (stored in the page header's
-reserved bytes 17–24) that records the LSN of the last log record applied
-to that page. During recovery:
-- **Redo:** Skip pages where `page_lsn >= log_record.lsn` (already applied).
-- **Undo:** Only undo records for uncommitted transactions.
+- `xmax` is committed
 
-### Transaction Chain (prev_lsn)
+For the current single-user mode, "committed" simply means the transaction
+completed successfully. Once concurrent sessions are added, a snapshot-based
+visibility check (like PostgreSQL's `HeapTupleSatisfiesMVCC`) replaces this.
 
-Each log record contains a `prev_lsn` field pointing to the previous log
-record for the same transaction. This forms a per-transaction chain that
-enables efficient rollback without scanning the entire log:
+### Operation Changes
 
-```
-TXN 42:  BEGIN ←── INSERT ←── UPDATE ←── DELETE ←── (current)
-         lsn=10   lsn=15     lsn=23     lsn=31
-         prev=0   prev=10    prev=15    prev=23
-```
+| Operation | Before (current)            | After (MVCC)                                                        |
+|-----------|-----------------------------|---------------------------------------------------------------------|
+| INSERT    | Write raw row bytes         | Prepend `(xmin=current_tx, xmax=0)` + row bytes                    |
+| DELETE    | Zero slot `(0,0)`           | Set `xmax = current_tx` in the tuple header on-page                 |
+| UPDATE    | In-place overwrite or migrate | Set `xmax` on old tuple + INSERT new tuple (append-only)          |
+| SCAN      | Skip zeroed slots           | Read tuple header, apply visibility rule, return only visible rows  |
+| VACUUM    | N/A                         | Compact pages: remove dead tuples, reclaim space, update FSM        |
 
-**Rollback** follows `prev_lsn` backwards, applying undo actions in reverse order.
+### Why Append-Only Updates?
 
-## WAL File Layout
+In-place updates require handling three cases (same size, larger-fits,
+larger-doesn't-fit) and introduce complexity around row migration, RID
+stability, and free-space tracking. Append-only updates (mark old dead +
+insert new) simplify this to a single code path, avoid page-level locking
+contention for future concurrency, and align naturally with MVCC — the old
+version stays readable by any transaction that started before the update.
 
-```
-data/TESTDB/log/
-├── WAL.000000     — first WAL segment (fixed size, e.g. 16 MB)
-├── WAL.000001     — second segment
-└── ...
-```
+---
 
-Each segment is a sequence of packed log records. The WAL writer appends
-to the current segment and rolls over to a new one when the segment is full.
+## Transaction Manager
 
-## Write Path (WAL-First Protocol)
+### TxID Allocation
 
-For each DML operation:
+- Monotonic `u64` counter, starting from 1
+- TxID 0 is reserved for bootstrap rows (always considered committed)
+- `next_txid` is persisted in `SQLDBCONF` so IDs never repeat across restarts
+
+### Transaction States
 
 ```
-1. Allocate LSN (monotonic counter)
-2. Build log record with before-image (undo) and after-image (redo)
-3. Append record to WAL buffer
-4. Flush WAL buffer to disk (fsync)          ← WAL is now durable
-5. Apply mutation to the buffer pool page    ← page may be lost on crash
-6. Set page_lsn = record.lsn
+Active  ──→  Committed
+  │
+  └──→  Aborted
 ```
 
-The key invariant: **a data page is never written to disk until all log
-records that modified it have been flushed to the WAL.** This is enforced
-at buffer pool eviction time — before evicting a dirty page, check that
-`page_lsn ≤ flushed_lsn`.
+State is tracked in-memory: `HashMap<TxID, TxState>` where
+`TxState = Active | Committed | Aborted`.
 
-## Rollback Protocol
+On startup, any TxID not in the committed set is treated as aborted
+(crash recovery without WAL — safe for single-user mode).
 
-When a transaction calls `rollback()`:
+### SQL Commands
 
-1. Read the transaction's last LSN from the active transaction table.
-2. Follow the `prev_lsn` chain backwards.
-3. For each record, apply the **undo action**:
-   - INSERT → delete the row at (page_id, slot)
-   - DELETE → re-insert the old row bytes at (page_id, slot)
-   - UPDATE → overwrite with old_row_bytes at (page_id, slot)
-4. Write a ROLLBACK record to the WAL.
-5. Remove from active transaction table.
+| Command    | Behavior                                                                 |
+|------------|--------------------------------------------------------------------------|
+| `BEGIN`    | Allocate next TxID, mark `Active`. Error if a transaction is already open. |
+| `COMMIT`   | Mark current TxID `Committed`, flush dirty pages.                       |
+| `ROLLBACK` | Mark current TxID `Aborted`. Inserted tuples become invisible; deleted tuples' xmax is aborted so they reappear. |
 
-Each undo operation is itself logged as a **Compensation Log Record (CLR)**
-so that undo work is not repeated if a crash occurs during rollback.
+Without an explicit `BEGIN`, each SQL statement runs in an implicit
+auto-commit transaction (allocate TxID → execute → commit).
 
-## ARIES Recovery (Crash Restart)
+---
 
-ARIES recovery runs in three phases after a crash:
+## Two-Page UPDATE Problem
 
-```
-Phase 1: Analysis
-  └─ Scan WAL forward from last checkpoint
-  └─ Rebuild active transaction table + dirty page table
+With append-only updates, an UPDATE touches **two pages**: exclusive latch
+on page A (set xmax on old row), then exclusive latch on page B (insert new
+row). This has performance and concurrency implications.
 
-Phase 2: Redo
-  └─ Scan WAL forward, redo all operations
-  └─ Skip records where page_lsn >= record.lsn (already applied)
-  └─ Brings all pages to their most recent state
+### Industry Solutions
 
-Phase 3: Undo
-  └─ For each transaction in the active table (not committed):
-       └─ Follow prev_lsn chain, apply undo actions
-       └─ Write CLRs for each undo
-  └─ All uncommitted work is rolled back
-```
+| Strategy | Used by | How it works | Trade-off |
+|----------|---------|--------------|-----------|
+| **PCTFREE / fillfactor** | DB2, Oracle, PostgreSQL | Reserve page space so the new version often fits on the same page | Wastes space on read-heavy tables |
+| **HOT (Heap-Only Tuples)** | PostgreSQL | If new version fits on same page AND no indexed columns changed, chain old→new without index update | Only works when no indexed columns change; requires indexes |
+| **Undo-based MVCC** | MySQL/InnoDB, Oracle | UPDATE is always in-place; old versions reconstructed from undo log | Undo log management complexity; long transactions bloat undo |
+| **Forwarding pointers** | Oracle (row migration) | Leave a stub on the original page pointing to the new location | Extra I/O for reads that follow the pointer |
+| **Delta storage** | Column stores, HTAP systems | Store only changed columns as a delta, not a full new row | Reconstruction cost on read; complex merge logic |
+| **In-place for same-size** | DB2 | Keep in-place UPDATE when row size doesn't change | Two code paths; doesn't help when row grows |
 
-## Transaction API (Planned)
+**RQDB's approach:** PCTFREE (implemented per-table in SYSTABLES — see
+[storage/README.md](../storage/README.md)) is the primary solution. HOT is a
+natural follow-on once B-tree indexes are added. Undo-based MVCC is a
+fundamentally different architecture and not on the roadmap.
 
-```rust
-pub struct Transaction {
-    txn_id: u64,
-    state: TxnState,       // Active, Committed, RolledBack
-    last_lsn: u64,         // tail of the prev_lsn chain
-}
+### Multi-Session Deadlock (Future)
 
-pub struct TransactionManager {
-    wal: WalWriter,
-    next_txn_id: u64,
-    active_txns: HashMap<u64, Transaction>,
-}
-
-impl TransactionManager {
-    pub fn begin(&mut self) -> u64;                    // returns txn_id
-    pub fn commit(&mut self, txn_id: u64) -> Result<()>;
-    pub fn rollback(&mut self, txn_id: u64) -> Result<()>;
-
-    // Called by the executor before each page mutation:
-    pub fn log_insert(&mut self, txn_id: u64, table_id: u32,
-                      page_id: u64, slot: u16,
-                      new_row: &[u8]) -> Result<u64>;  // returns LSN
-
-    pub fn log_delete(&mut self, txn_id: u64, table_id: u32,
-                      page_id: u64, slot: u16,
-                      old_row: &[u8]) -> Result<u64>;
-
-    pub fn log_update(&mut self, txn_id: u64, table_id: u32,
-                      page_id: u64, slot: u16,
-                      old_row: &[u8], new_row: &[u8]) -> Result<u64>;
-}
-```
-
-## Integration with Executor
-
-The executor's DML flow changes from:
+When concurrent sessions are added, two transactions updating each other's
+pages could deadlock:
 
 ```
-// OLD: no WAL logging
-tsm.delete_row(schema, table, rid)?;
-tsm.insert_row(schema, table, &new_bytes)?;
+Tx1: latch page 5 → wants page 8
+Tx2: latch page 8 → wants page 5
 ```
 
-To:
+**Mitigation strategies** (for the future multi-session milestone):
 
-```
-// NEW: WAL-first with in-place update
-let lsn = txn_mgr.log_update(txn_id, table_id,
-                               rid.page_id, rid.slot,
-                               &old_bytes, &new_bytes)?;
-let result = tsm.update_row(schema, table, rid, &new_bytes)?;
-// If migrated, log a CLR for the old location and a new INSERT log
-```
+1. **Latch ordering**: Always acquire page latches in ascending `page_id`
+   order.
+2. **Release-before-acquire**: Release the latch on the old-row page after
+   writing xmax, before acquiring the latch on the new-row page. Safe
+   because xmax is already durable in the frame.
+3. **Latch timeout + retry**: Abort and retry if a latch cannot be acquired
+   within a deadline.
 
-## Implementation Phases
+None of these require changes now — single-user mode has no contention.
 
-### Phase 1: WAL Infrastructure
-- [ ] `WalWriter` — append-only log file with fsync
-- [ ] Log record serialization/deserialization
-- [ ] LSN allocation (atomic counter)
-- [ ] WAL segment management (rollover)
+---
 
-### Phase 2: Transaction Lifecycle
-- [ ] `TransactionManager` with begin/commit/rollback
-- [ ] Active transaction table
-- [ ] `prev_lsn` chain maintenance
-- [ ] Rollback via undo chain
+## Dirty Pages and Latches — Compatibility with MVCC
 
-### Phase 3: DML Logging
-- [ ] Wire INSERT/DELETE/UPDATE log calls into executor
-- [ ] Page LSN tracking (store in page header reserved bytes)
-- [ ] Buffer pool eviction check: `page_lsn ≤ flushed_lsn`
+The current buffer pool model (`pool.rs`) is **fully compatible with
+single-user MVCC**:
 
-### Phase 4: ARIES Recovery
-- [ ] Analysis phase (rebuild active txn + dirty page tables)
-- [ ] Redo phase (forward scan, skip already-applied)
-- [ ] Undo phase (backward chain, CLR generation)
-- [ ] Checkpoint records (reduce recovery scan range)
+| Concern | Assessment |
+|---------|------------|
+| DELETE (set xmax, 8 bytes) | `fetch_page_mut` → write xmax → `unpin(dirty=true)`. Same pattern as today's slot-zeroing. |
+| INSERT (prepend header + row) | Same as today, just more bytes per row (16-byte header overhead). |
+| UPDATE (xmax on old + insert new) | Two sequential exclusive latches: page A then page B. No issue in single-user mode. |
+| SCAN (read tuple header) | `fetch_page` → read header → check visibility → `unpin`. Same shared-latch pattern. |
+| Dirty page volume | UPDATE dirties 2 pages instead of 1. LRU + `flush_all` handles this transparently. |
+| VACUUM (compact page) | `fetch_page_mut` → rebuild page → `unpin(dirty=true)`. Standard exclusive-latch write. |
+
+PCTFREE reduces the two-page UPDATE to a single-page operation when the
+new version fits in the reserved space — one exclusive latch, one dirty page.
+
+---
+
+## File-by-File Changes
+
+### New files
+
+- **`src/transaction/tx.rs`** — Transaction manager
+  - `struct TxManager { next_id: u64, states: HashMap<TxID, TxState> }`
+  - `begin() -> TxID`, `commit(TxID)`, `abort(TxID)`, `is_committed(TxID) -> bool`
+  - Persistence: save/load `next_id` from SQLDBCONF
+
+- **`src/storage/tuple.rs`** — Tuple header helpers (in `storage/`)
+  - `const TUPLE_HEADER_SIZE: usize = 16`
+  - `write_header(xmin, xmax) -> [u8; 16]`
+  - `read_header(bytes) -> (xmin, xmax)`
+  - `set_xmax(buf, slot, xmax)` — mutate xmax in-place on a page
+  - `strip_header(bytes) -> &[u8]` — return user data portion
+  - `prepend_header(xmin, row_data) -> Vec<u8>`
+
+### Modified files
+
+- **`src/storage/page.rs`** — Add `compact_page(buf)` for VACUUM
+- **`src/storage/tablespace.rs`** — INSERT prepends header; DELETE sets xmax;
+  UPDATE becomes append-only; SCAN applies visibility; respects PCTFREE
+- **`src/sql/executor.rs`** — Pass TxID to DML; dispatch BEGIN/COMMIT/ROLLBACK;
+  add VACUUM command
+- **`src/catalog/bootstrap.rs`** — Bootstrap rows get `xmin = 0`
+- **`src/catalog/loader.rs`** — Strip tuple headers when loading catalog
+- **`src/catalog/config.rs`** — Add `next_txid` to SQLDBCONF
+- **`src/db.rs`** — Add `TxManager` to Database struct
+- **`src/main.rs`** — Parse BEGIN/COMMIT/ROLLBACK in REPL
+- **`src/error.rs`** — Add `ActiveTransaction`, `NoActiveTransaction` SQLSTATE codes
+
+---
+
+## Implementation Order
+
+1. Tuple header module (`src/storage/tuple.rs`)
+2. Transaction manager (`src/transaction/tx.rs`)
+3. Bootstrap + config changes (catalog rows get headers, SQLDBCONF stores next_txid)
+4. Tablespace changes (insert/delete/update/scan with tuple headers + visibility)
+5. PCTFREE in SYSTABLES + FSM-aware insert (see [storage/README.md](../storage/README.md))
+6. Executor changes (pass TxID, wire BEGIN/COMMIT/ROLLBACK, auto-commit)
+7. VACUUM implementation (page compaction + SQL command — see [storage/README.md](../storage/README.md))
+8. REPL integration (BEGIN/COMMIT/ROLLBACK in the shell)
+9. Tests (update existing, add new for transactions/visibility/rollback/VACUUM)
+
+## Migration
+
+This is a **breaking on-disk format change**. A format version field in
+SQLDBCONF rejects old-format databases with a clear error message.

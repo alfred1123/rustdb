@@ -1,0 +1,27 @@
+---
+description: Always design with future multi-threaded / multi-session infrastructure in mind
+globs: "**/*.rs"
+alwaysApply: true
+---
+
+# Multi-Threaded Awareness
+
+RQDB is currently single-user / single-session, but all code must be designed
+with future multi-threaded infrastructure in mind.
+
+## Guidelines
+
+- **Latch ordering**: When acquiring exclusive latches on multiple pages,
+  always acquire in ascending `page_id` order to prevent deadlocks.
+- **Short latch holds**: Release page latches as soon as possible. Never hold
+  a latch while performing I/O on a different page.
+- **No global mutable state**: Prefer passing context (TxID, snapshot) through
+  function parameters rather than storing in global/static variables.
+- **Owned data over shared references**: Prefer returning owned data from
+  page reads rather than holding borrows across latch boundaries.
+- **Consider contention**: When adding new features, document which latches
+  or locks would be needed in a concurrent environment, even if the current
+  implementation is single-threaded.
+- **Avoid `Rc`; prefer `Arc`**: When reference counting is needed, use
+  `Arc` so the transition to multi-threaded is seamless.
+- **Thread-safe error types**: Keep `Error` types `Send + Sync`.

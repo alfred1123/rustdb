@@ -4,9 +4,10 @@ A transactional relational database engine written from scratch in Rust,
 following IBM DB2-style catalog and tablespace conventions and ANSI SQL
 standards.
 
-**Status:** Storage engine and full CRUD SQL are complete. CREATE TABLE, INSERT,
-UPDATE, DELETE, and SELECT all work with WHERE filtering. Data persists across
-restarts. Transactions and networking are in progress.
+**Status:** Storage engine and full CRUD SQL are complete. CREATE TABLE, DROP
+TABLE, INSERT, UPDATE, DELETE, and SELECT all work with WHERE filtering. Data
+persists across restarts. MVCC (xmin/xmax tuple headers), transactions
+(BEGIN/COMMIT/ROLLBACK), and VACUUM are next.
 
 ## Why RQDB?
 
@@ -52,8 +53,8 @@ restarts. Transactions and networking are in progress.
 | **Buffer pool** | Named pools, per-tablespace routing | Single page cache | `shared_buffers` | Memory-mapped |
 | **Deployment** | Single binary, no runtime | Single file, no runtime | Server + client + extensions | Single library |
 | **Concurrency** | Single-session (multi-session planned) | File-level locking / WAL mode | Full MVCC | Single-writer |
-| **SQL coverage** | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
-| **Transactions** | Planned (ARIES-style WAL) | WAL or journal | WAL + MVCC | WAL |
+| **SQL coverage** | SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE + WHERE | Full SQL | Full SQL + extensions | Full SQL (analytical) |
+| **Transactions** | MVCC with xmin/xmax (in progress) | WAL or journal | WAL + MVCC | WAL |
 | **Codebase size** | ~7K lines | ~150K lines | ~1.5M lines | ~300K lines |
 
 ### When to Consider RQDB
@@ -116,7 +117,7 @@ rqdb/
 │   ├── catalog/              # System catalog, bootstrap, loader, cache
 │   ├── storage/              # Slotted pages, heap files, FSM, buffer pool, tablespace manager
 │   ├── sql/                  # SQL parser + executor (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE)
-│   ├── transaction/          # WAL, concurrency, recovery (planned)
+│   ├── transaction/          # MVCC, transactions, VACUUM (see transaction/README.md)
 │   └── server/               # TCP listener, wire protocol (planned)
 ├── data/                     # Database instances (e.g. data/MYDB/)
 ├── Cargo.toml
@@ -268,6 +269,18 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 | `sqlparser`  | 0.55    | SQL parsing            |
 | `crc32fast`  | 1       | Page checksums         |
 
+## Next Milestone: MVCC, Transactions, and VACUUM
+
+RQDB is moving from physical delete / in-place update to PostgreSQL-style
+MVCC — each row carries an `xmin`/`xmax` tuple header for visibility,
+updates are append-only (old row marked dead, new row inserted), and a
+`VACUUM` command reclaims dead space. A basic transaction manager
+(`BEGIN`/`COMMIT`/`ROLLBACK`) provides the TxID lifecycle.
+
+See [src/transaction/README.md](src/transaction/README.md) for the full
+design: tuple header format, visibility rules, operation changes, VACUUM
+algorithm, and implementation plan.
+
 ## Roadmap
 
 - [x] Slotted pages with CRC32 checksums
@@ -286,9 +299,15 @@ Types: `SMALLINT` (2B LE), `INTEGER` (4B LE), `BIGINT` (8B LE), `VARCHAR(n)`
 - [x] SQLSTATE error codes for all SQL errors
 - [x] CONNECT TO / CREATE DATABASE / DISCONNECT (safe database management)
 - [x] DROP TABLE (DDL)
+- [ ] MVCC with xmin/xmax tuple headers (next)
+- [ ] Transaction manager (BEGIN / COMMIT / ROLLBACK)
+- [ ] PCTFREE per-table free space reservation
+- [ ] VACUUM (manual dead-tuple reclamation)
 - [ ] Write-ahead log (WAL) with ARIES-style recovery
-- [ ] MVCC or lock-based concurrency control
 - [ ] B-tree indexes
+- [ ] HOT (Heap-Only Tuples) — same-page update chaining without index updates
+- [ ] Forwarding pointers — row migration stubs for cross-page updates
+- [ ] Page splitting — split full heap pages to create headroom
 - [ ] TCP server with wire protocol
 - [ ] Multi-session support
 
